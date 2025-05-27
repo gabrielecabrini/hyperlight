@@ -26,9 +26,15 @@ extern crate mshv_ioctls3 as mshv_ioctls;
 
 use std::fmt::{Debug, Formatter};
 
-use log::error;
+use log::{error, LevelFilter};
 #[cfg(mshv2)]
 use mshv_bindings::hv_message;
+#[cfg(gdb)]
+use mshv_bindings::{
+    hv_intercept_parameters, hv_intercept_type_HV_INTERCEPT_TYPE_EXCEPTION,
+    hv_message_type_HVMSG_X64_EXCEPTION_INTERCEPT, mshv_install_intercept,
+    HV_INTERCEPT_ACCESS_MASK_EXECUTE,
+};
 use mshv_bindings::{
     hv_message_type, hv_message_type_HVMSG_GPA_INTERCEPT, hv_message_type_HVMSG_UNMAPPED_GPA,
     hv_message_type_HVMSG_X64_HALT, hv_message_type_HVMSG_X64_IO_PORT_INTERCEPT, hv_register_assoc,
@@ -44,6 +50,10 @@ use mshv_ioctls::{Mshv, VcpuFd, VmFd};
 use tracing::{instrument, Span};
 
 use super::fpu::{FP_CONTROL_WORD_DEFAULT, FP_TAG_WORD_DEFAULT, MXCSR_DEFAULT};
+#[cfg(gdb)]
+use super::gdb::{DebugCommChannel, DebugMsg, DebugResponse, GuestDebug, MshvDebug};
+#[cfg(gdb)]
+use super::handlers::DbgMemAccessHandlerWrapper;
 use super::handlers::{MemAccessHandlerWrapper, OutBHandlerWrapper};
 use super::{
     Hypervisor, VirtualCPU, CR0_AM, CR0_ET, CR0_MP, CR0_NE, CR0_PE, CR0_PG, CR0_WP, CR4_OSFXSR,
@@ -53,21 +63,222 @@ use crate::hypervisor::hypervisor_handler::HypervisorHandler;
 use crate::hypervisor::HyperlightExit;
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
 use crate::mem::ptr::{GuestPtr, RawPtr};
+#[cfg(gdb)]
+use crate::HyperlightError;
 use crate::{log_then_return, new_error, Result};
+
+#[cfg(gdb)]
+mod debug {
+    use std::sync::{Arc, Mutex};
+
+    use super::mshv_bindings::hv_x64_exception_intercept_message;
+    use super::{HypervLinuxDriver, *};
+    use crate::hypervisor::gdb::{DebugMsg, DebugResponse, VcpuStopReason, X86_64Regs};
+    use crate::hypervisor::handlers::DbgMemAccessHandlerCaller;
+    use crate::{new_error, Result};
+
+    impl HypervLinuxDriver {
+        /// Resets the debug information to disable debugging
+        fn disable_debug(&mut self) -> Result<()> {
+            let mut debug = MshvDebug::default();
+
+            debug.set_single_step(&self.vcpu_fd, false)?;
+
+            self.debug = Some(debug);
+
+            Ok(())
+        }
+
+        /// Get the reason the vCPU has stopped
+        pub(crate) fn get_stop_reason(
+            &mut self,
+            ex_info: hv_x64_exception_intercept_message,
+        ) -> Result<VcpuStopReason> {
+            let debug = self
+                .debug
+                .as_mut()
+                .ok_or_else(|| new_error!("Debug is not enabled"))?;
+
+            debug.get_stop_reason(&self.vcpu_fd, ex_info.exception_vector, self.entrypoint)
+        }
+
+        pub(crate) fn process_dbg_request(
+            &mut self,
+            req: DebugMsg,
+            dbg_mem_access_fn: Arc<Mutex<dyn DbgMemAccessHandlerCaller>>,
+        ) -> Result<DebugResponse> {
+            if let Some(debug) = self.debug.as_mut() {
+                match req {
+                    DebugMsg::AddHwBreakpoint(addr) => Ok(DebugResponse::AddHwBreakpoint(
+                        debug
+                            .add_hw_breakpoint(&self.vcpu_fd, addr)
+                            .map_err(|e| {
+                                log::error!("Failed to add hw breakpoint: {:?}", e);
+
+                                e
+                            })
+                            .is_ok(),
+                    )),
+                    DebugMsg::AddSwBreakpoint(addr) => Ok(DebugResponse::AddSwBreakpoint(
+                        debug
+                            .add_sw_breakpoint(&self.vcpu_fd, addr, dbg_mem_access_fn)
+                            .map_err(|e| {
+                                log::error!("Failed to add sw breakpoint: {:?}", e);
+
+                                e
+                            })
+                            .is_ok(),
+                    )),
+                    DebugMsg::Continue => {
+                        debug.set_single_step(&self.vcpu_fd, false).map_err(|e| {
+                            log::error!("Failed to continue execution: {:?}", e);
+
+                            e
+                        })?;
+
+                        Ok(DebugResponse::Continue)
+                    }
+                    DebugMsg::DisableDebug => {
+                        self.disable_debug().map_err(|e| {
+                            log::error!("Failed to disable debugging: {:?}", e);
+
+                            e
+                        })?;
+
+                        Ok(DebugResponse::DisableDebug)
+                    }
+                    DebugMsg::GetCodeSectionOffset => {
+                        let offset = dbg_mem_access_fn
+                            .try_lock()
+                            .map_err(|e| {
+                                new_error!("Error locking at {}:{}: {}", file!(), line!(), e)
+                            })?
+                            .get_code_offset()
+                            .map_err(|e| {
+                                log::error!("Failed to get code offset: {:?}", e);
+
+                                e
+                            })?;
+
+                        Ok(DebugResponse::GetCodeSectionOffset(offset as u64))
+                    }
+                    DebugMsg::ReadAddr(addr, len) => {
+                        let mut data = vec![0u8; len];
+
+                        debug
+                            .read_addrs(&self.vcpu_fd, addr, &mut data, dbg_mem_access_fn)
+                            .map_err(|e| {
+                                log::error!("Failed to read from address: {:?}", e);
+
+                                e
+                            })?;
+
+                        Ok(DebugResponse::ReadAddr(data))
+                    }
+                    DebugMsg::ReadRegisters => {
+                        let mut regs = X86_64Regs::default();
+
+                        debug
+                            .read_regs(&self.vcpu_fd, &mut regs)
+                            .map_err(|e| {
+                                log::error!("Failed to read registers: {:?}", e);
+
+                                e
+                            })
+                            .map(|_| DebugResponse::ReadRegisters(regs))
+                    }
+                    DebugMsg::RemoveHwBreakpoint(addr) => Ok(DebugResponse::RemoveHwBreakpoint(
+                        debug
+                            .remove_hw_breakpoint(&self.vcpu_fd, addr)
+                            .map_err(|e| {
+                                log::error!("Failed to remove hw breakpoint: {:?}", e);
+
+                                e
+                            })
+                            .is_ok(),
+                    )),
+                    DebugMsg::RemoveSwBreakpoint(addr) => Ok(DebugResponse::RemoveSwBreakpoint(
+                        debug
+                            .remove_sw_breakpoint(&self.vcpu_fd, addr, dbg_mem_access_fn)
+                            .map_err(|e| {
+                                log::error!("Failed to remove sw breakpoint: {:?}", e);
+
+                                e
+                            })
+                            .is_ok(),
+                    )),
+                    DebugMsg::Step => {
+                        debug.set_single_step(&self.vcpu_fd, true).map_err(|e| {
+                            log::error!("Failed to enable step instruction: {:?}", e);
+
+                            e
+                        })?;
+
+                        Ok(DebugResponse::Step)
+                    }
+                    DebugMsg::WriteAddr(addr, data) => {
+                        debug
+                            .write_addrs(&self.vcpu_fd, addr, &data, dbg_mem_access_fn)
+                            .map_err(|e| {
+                                log::error!("Failed to write to address: {:?}", e);
+
+                                e
+                            })?;
+
+                        Ok(DebugResponse::WriteAddr)
+                    }
+                    DebugMsg::WriteRegisters(regs) => debug
+                        .write_regs(&self.vcpu_fd, &regs)
+                        .map_err(|e| {
+                            log::error!("Failed to write registers: {:?}", e);
+
+                            e
+                        })
+                        .map(|_| DebugResponse::WriteRegisters),
+                }
+            } else {
+                Err(new_error!("Debugging is not enabled"))
+            }
+        }
+
+        pub(crate) fn recv_dbg_msg(&mut self) -> Result<DebugMsg> {
+            let gdb_conn = self
+                .gdb_conn
+                .as_mut()
+                .ok_or_else(|| new_error!("Debug is not enabled"))?;
+
+            gdb_conn.recv().map_err(|e| {
+                new_error!(
+                    "Got an error while waiting to receive a
+                    message: {:?}",
+                    e
+                )
+            })
+        }
+
+        pub(crate) fn send_dbg_msg(&mut self, cmd: DebugResponse) -> Result<()> {
+            log::debug!("Sending {:?}", cmd);
+
+            let gdb_conn = self
+                .gdb_conn
+                .as_mut()
+                .ok_or_else(|| new_error!("Debug is not enabled"))?;
+
+            gdb_conn
+                .send(cmd)
+                .map_err(|e| new_error!("Got an error while sending a response message {:?}", e))
+        }
+    }
+}
 
 /// Determine whether the HyperV for Linux hypervisor API is present
 /// and functional.
 #[instrument(skip_all, parent = Span::current(), level = "Trace")]
 pub(crate) fn is_hypervisor_present() -> bool {
-    match Mshv::open_with_cloexec(true) {
-        Ok(fd) => {
-            unsafe {
-                libc::close(fd);
-            } // must explicitly close fd to avoid a leak
-            true
-        }
-        Err(e) => {
-            log::info!("Error creating MSHV object: {:?}", e);
+    match Mshv::new() {
+        Ok(_) => true,
+        Err(_) => {
+            log::info!("MSHV is not available on this system");
             false
         }
     }
@@ -82,6 +293,11 @@ pub(super) struct HypervLinuxDriver {
     entrypoint: u64,
     mem_regions: Vec<MemoryRegion>,
     orig_rsp: GuestPtr,
+
+    #[cfg(gdb)]
+    debug: Option<MshvDebug>,
+    #[cfg(gdb)]
+    gdb_conn: Option<DebugCommChannel<DebugResponse, DebugMsg>>,
 }
 
 impl HypervLinuxDriver {
@@ -99,6 +315,7 @@ impl HypervLinuxDriver {
         entrypoint_ptr: GuestPtr,
         rsp_ptr: GuestPtr,
         pml4_ptr: GuestPtr,
+        #[cfg(gdb)] gdb_conn: Option<DebugCommChannel<DebugResponse, DebugMsg>>,
     ) -> Result<Self> {
         let mshv = Mshv::new()?;
         let pr = Default::default();
@@ -122,6 +339,43 @@ impl HypervLinuxDriver {
 
         let mut vcpu_fd = vm_fd.create_vcpu(0)?;
 
+        #[cfg(gdb)]
+        let (debug, gdb_conn) = if let Some(gdb_conn) = gdb_conn {
+            let mut debug = MshvDebug::new();
+            debug.add_hw_breakpoint(&vcpu_fd, entrypoint_ptr.absolute()?)?;
+
+            // The bellow intercepts make the vCPU exit with the Exception Intercept exit code
+            // Check Table 6-1. Exceptions and Interrupts at Page 6-13 Vol. 1
+            // of Intel 64 and IA-32 Architectures Software Developer's Manual
+            // Install intercept for #DB (1) exception
+            vm_fd
+                .install_intercept(mshv_install_intercept {
+                    access_type_mask: HV_INTERCEPT_ACCESS_MASK_EXECUTE,
+                    intercept_type: hv_intercept_type_HV_INTERCEPT_TYPE_EXCEPTION,
+                    // Exception handler #DB (1)
+                    intercept_parameter: hv_intercept_parameters {
+                        exception_vector: 0x1,
+                    },
+                })
+                .map_err(|e| new_error!("Cannot install debug exception intercept: {}", e))?;
+
+            // Install intercept for #BP (3) exception
+            vm_fd
+                .install_intercept(mshv_install_intercept {
+                    access_type_mask: HV_INTERCEPT_ACCESS_MASK_EXECUTE,
+                    intercept_type: hv_intercept_type_HV_INTERCEPT_TYPE_EXCEPTION,
+                    // Exception handler #BP (3)
+                    intercept_parameter: hv_intercept_parameters {
+                        exception_vector: 0x3,
+                    },
+                })
+                .map_err(|e| new_error!("Cannot install breakpoint exception intercept: {}", e))?;
+
+            (Some(debug), Some(gdb_conn))
+        } else {
+            (None, None)
+        };
+
         mem_regions.iter().try_for_each(|region| {
             let mshv_region = region.to_owned().into();
             vm_fd.map_user_memory(mshv_region)
@@ -136,6 +390,11 @@ impl HypervLinuxDriver {
             mem_regions,
             entrypoint: entrypoint_ptr.absolute()?,
             orig_rsp: rsp_ptr,
+
+            #[cfg(gdb)]
+            debug,
+            #[cfg(gdb)]
+            gdb_conn,
         })
     }
 
@@ -203,17 +462,24 @@ impl Hypervisor for HypervLinuxDriver {
         outb_hdl: OutBHandlerWrapper,
         mem_access_hdl: MemAccessHandlerWrapper,
         hv_handler: Option<HypervisorHandler>,
+        max_guest_log_level: Option<LevelFilter>,
+        #[cfg(gdb)] dbg_mem_access_fn: DbgMemAccessHandlerWrapper,
     ) -> Result<()> {
+        let max_guest_log_level: u64 = match max_guest_log_level {
+            Some(level) => level as u64,
+            None => self.get_max_log_level().into(),
+        };
+
         let regs = StandardRegisters {
             rip: self.entrypoint,
             rsp: self.orig_rsp.absolute()?,
             rflags: 2, //bit 1 of rlags is required to be set
 
             // function args
-            rcx: peb_addr.into(),
-            rdx: seed,
-            r8: page_size.into(),
-            r9: self.get_max_log_level().into(),
+            rdi: peb_addr.into(),
+            rsi: seed,
+            rdx: page_size.into(),
+            rcx: max_guest_log_level,
 
             ..Default::default()
         };
@@ -224,14 +490,10 @@ impl Hypervisor for HypervLinuxDriver {
             hv_handler,
             outb_hdl,
             mem_access_hdl,
+            #[cfg(gdb)]
+            dbg_mem_access_fn,
         )?;
 
-        // reset RSP to what it was before initialise
-        self.vcpu_fd.set_regs(&StandardRegisters {
-            rsp: self.orig_rsp.absolute()?,
-            rflags: 2, //bit 1 of rlags is required to be set
-            ..Default::default()
-        })?;
         Ok(())
     }
 
@@ -242,12 +504,12 @@ impl Hypervisor for HypervLinuxDriver {
         outb_handle_fn: OutBHandlerWrapper,
         mem_access_fn: MemAccessHandlerWrapper,
         hv_handler: Option<HypervisorHandler>,
+        #[cfg(gdb)] dbg_mem_access_fn: DbgMemAccessHandlerWrapper,
     ) -> Result<()> {
-        // Reset general purpose registers except RSP, then set RIP
-        let rsp_before = self.vcpu_fd.get_regs()?.rsp;
+        // Reset general purpose registers, then set RIP and RSP
         let regs = StandardRegisters {
             rip: dispatch_func_addr.into(),
-            rsp: rsp_before,
+            rsp: self.orig_rsp.absolute()?,
             rflags: 2, //bit 1 of rlags is required to be set
             ..Default::default()
         };
@@ -268,14 +530,10 @@ impl Hypervisor for HypervLinuxDriver {
             hv_handler,
             outb_handle_fn,
             mem_access_fn,
+            #[cfg(gdb)]
+            dbg_mem_access_fn,
         )?;
 
-        // reset RSP to what it was before function call
-        self.vcpu_fd.set_regs(&StandardRegisters {
-            rsp: rsp_before,
-            rflags: 2, //bit 1 of rlags is required to be set
-            ..Default::default()
-        })?;
         Ok(())
     }
 
@@ -288,11 +546,15 @@ impl Hypervisor for HypervLinuxDriver {
         instruction_length: u64,
         outb_handle_fn: OutBHandlerWrapper,
     ) -> Result<()> {
-        let payload = data[..8].try_into()?;
+        let mut padded = [0u8; 4];
+        let copy_len = data.len().min(4);
+        padded[..copy_len].copy_from_slice(&data[..copy_len]);
+        let val = u32::from_le_bytes(padded);
+
         outb_handle_fn
             .try_lock()
             .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?
-            .call(port, u64::from_le_bytes(payload))?;
+            .call(port, val)?;
 
         // update rip
         self.vcpu_fd.set_reg(&[hv_register_assoc {
@@ -312,6 +574,8 @@ impl Hypervisor for HypervLinuxDriver {
             hv_message_type_HVMSG_X64_IO_PORT_INTERCEPT;
         const UNMAPPED_GPA_MESSAGE: hv_message_type = hv_message_type_HVMSG_UNMAPPED_GPA;
         const INVALID_GPA_ACCESS_MESSAGE: hv_message_type = hv_message_type_HVMSG_GPA_INTERCEPT;
+        #[cfg(gdb)]
+        const EXCEPTION_INTERCEPT: hv_message_type = hv_message_type_HVMSG_X64_EXCEPTION_INTERCEPT;
 
         #[cfg(mshv2)]
         let run_result = {
@@ -369,6 +633,28 @@ impl Hypervisor for HypervLinuxDriver {
                         None => HyperlightExit::Mmio(gpa),
                     }
                 }
+                // The only case an intercept exit is expected is when debugging is enabled
+                // and the intercepts are installed.
+                // Provide the extra information about the exception to accurately determine
+                // the stop reason
+                #[cfg(gdb)]
+                EXCEPTION_INTERCEPT => {
+                    // Extract exception info from the message so we can figure out
+                    // more information about the vCPU state
+                    let ex_info = match m.to_exception_info() {
+                        Ok(info) => info,
+                        Err(e) => {
+                            log_then_return!("Error converting to exception info: {:?}", e);
+                        }
+                    };
+
+                    match self.get_stop_reason(ex_info) {
+                        Ok(reason) => HyperlightExit::Debug(reason),
+                        Err(e) => {
+                            log_then_return!("Error getting stop reason: {:?}", e);
+                        }
+                    }
+                }
                 other => {
                     crate::debug!("mshv Other Exit: Exit: {:#?} \n {:#?}", other, &self);
                     log_then_return!("unknown Hyper-V run message type {:?}", other);
@@ -395,6 +681,51 @@ impl Hypervisor for HypervLinuxDriver {
     #[cfg(crashdump)]
     fn get_memory_regions(&self) -> &[MemoryRegion] {
         &self.mem_regions
+    }
+
+    #[cfg(gdb)]
+    fn handle_debug(
+        &mut self,
+        dbg_mem_access_fn: std::sync::Arc<
+            std::sync::Mutex<dyn super::handlers::DbgMemAccessHandlerCaller>,
+        >,
+        stop_reason: super::gdb::VcpuStopReason,
+    ) -> Result<()> {
+        self.send_dbg_msg(DebugResponse::VcpuStopped(stop_reason))
+            .map_err(|e| new_error!("Couldn't signal vCPU stopped event to GDB thread: {:?}", e))?;
+
+        loop {
+            log::debug!("Debug wait for event to resume vCPU");
+
+            // Wait for a message from gdb
+            let req = self.recv_dbg_msg()?;
+
+            let result = self.process_dbg_request(req, dbg_mem_access_fn.clone());
+
+            let response = match result {
+                Ok(response) => response,
+                // Treat non fatal errors separately so the guest doesn't fail
+                Err(HyperlightError::TranslateGuestAddress(_)) => DebugResponse::ErrorOccurred,
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+
+            // If the command was either step or continue, we need to run the vcpu
+            let cont = matches!(
+                response,
+                DebugResponse::Step | DebugResponse::Continue | DebugResponse::DisableDebug
+            );
+
+            self.send_dbg_msg(response)
+                .map_err(|e| new_error!("Couldn't send response to gdb: {:?}", e))?;
+
+            if cont {
+                break;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -462,6 +793,14 @@ mod tests {
             MemoryRegionFlags::READ | MemoryRegionFlags::WRITE | MemoryRegionFlags::EXECUTE,
             crate::mem::memory_region::MemoryRegionType::Code,
         );
-        super::HypervLinuxDriver::new(regions.build(), entrypoint_ptr, rsp_ptr, pml4_ptr).unwrap();
+        super::HypervLinuxDriver::new(
+            regions.build(),
+            entrypoint_ptr,
+            rsp_ptr,
+            pml4_ptr,
+            #[cfg(gdb)]
+            None,
+        )
+        .unwrap();
     }
 }

@@ -4,10 +4,20 @@ updates:
     directory: "/"
     schedule:
       interval: "daily"
-    labels: []
+      time: "03:00"
+    labels:
+      - "kind/dependencies"
   - package-ecosystem: "cargo"
-    directories: ["/", "src/tests/rust_guests/simpleguest","src/tests/rust_guests/callbackguest"]
+    directory: "/"
     schedule:
       interval: "daily"
+      time: "03:00"
     labels:
-      - "area/dependencies"
+      - "kind/dependencies"
+    ignore:
+    # The way we are using 2 different versions of the mshv crates seems to break dependabot
+      - dependency-name: "mshv-ioctls"
+        versions: [ ">=0.2.1" ]
+      - dependency-name: "mshv-bindings"
+        versions: [ ">=0.2.1" ]
+    open-pull-requests-limit: 20

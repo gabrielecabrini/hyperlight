@@ -27,9 +27,7 @@ use tracing::{instrument, Span};
 use windows::core::PCSTR;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-#[cfg(all(target_os = "windows", inprocess))]
-use windows::Win32::System::Memory::FILE_MAP_EXECUTE;
-#[cfg(all(target_os = "windows", not(inprocess)))]
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Memory::PAGE_READWRITE;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Memory::{
@@ -78,7 +76,6 @@ macro_rules! generate_writer {
     ($fname:ident, $ty:ty) => {
         /// Write a value of type `$ty` to the memory at the given offset.
         #[allow(dead_code)]
-        #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
         pub(crate) fn $fname(&mut self, offset: usize, value: $ty) -> Result<()> {
             let data = self.as_mut_slice();
             bounds_check!(offset, std::mem::size_of::<$ty>(), data.len());
@@ -229,7 +226,7 @@ unsafe impl Send for GuestSharedMemory {}
 /// sadly, mostly un-adopted for C++23, although that does not concern
 /// us), the paper did not actually redefine volatile accesses or data
 /// races to prevent volatile accesses from racing with other accesses
-/// and causing undefined behaviour.  P1382R1 [5] would have amendend
+/// and causing undefined behaviour.  P1382R1 [5] would have amended
 /// the wording of the data race definition to specifically exclude
 /// volatile, but, unfortunately, despite receiving a
 /// generally-positive reception at its first WG21 meeting more than
@@ -257,7 +254,7 @@ unsafe impl Send for GuestSharedMemory {}
 /// In short, none of the Rust-level operations available to us do the
 /// right thing, at the Rust spec level or the LLVM spec level. Our
 /// major remaining options are therefore:
-///   - Choose one of the options that is avaiblale to us, and accept
+///   - Choose one of the options that is available to us, and accept
 ///     that we are doing something unsound according to the spec, but
 ///     hope that no reasonable compiler could possibly notice.
 ///   - Use inline assembly per architecture, for which we would only
@@ -328,10 +325,13 @@ impl ExclusiveSharedMemory {
             .checked_add(2 * PAGE_SIZE_USIZE) // guard page around the memory
             .ok_or_else(|| new_error!("Memory required for sandbox exceeded usize::MAX"))?;
 
-        assert!(
-            total_size % PAGE_SIZE_USIZE == 0,
-            "shared memory must be a multiple of 4096"
-        );
+        if total_size % PAGE_SIZE_USIZE != 0 {
+            return Err(new_error!(
+                "shared memory must be a multiple of {}",
+                PAGE_SIZE_USIZE
+            ));
+        }
+
         // usize and isize are guaranteed to be the same size, and
         // isize::MAX should be positive, so this cast should be safe.
         if total_size > isize::MAX as usize {
@@ -426,10 +426,7 @@ impl ExclusiveSharedMemory {
         // Allocate the memory use CreateFileMapping instead of VirtualAlloc
         // This allows us to map the memory into the surrogate process using MapViewOfFile2
 
-        #[cfg(not(inprocess))]
         let flags = PAGE_READWRITE;
-        #[cfg(inprocess)]
-        let flags = PAGE_EXECUTE_READWRITE;
 
         let handle = unsafe {
             CreateFileMappingA(
@@ -448,11 +445,7 @@ impl ExclusiveSharedMemory {
             ));
         }
 
-        #[cfg(not(inprocess))]
         let file_map = FILE_MAP_ALL_ACCESS;
-        #[cfg(inprocess)]
-        let file_map = FILE_MAP_ALL_ACCESS | FILE_MAP_EXECUTE;
-
         let addr = unsafe { MapViewOfFile(handle, file_map, 0, 0, 0) };
 
         if addr.Value.is_null() {
@@ -583,8 +576,7 @@ impl ExclusiveSharedMemory {
     ///   the safety documentation of pointer::offset.
     ///
     ///   This is ensured by a check in ::new()
-    #[instrument(skip_all, parent = Span::current(), level= "Trace")]
-    pub(super) fn as_mut_slice<'a>(&'a mut self) -> &'a mut [u8] {
+    pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.base_ptr(), self.mem_size()) }
     }
 
@@ -705,7 +697,6 @@ pub trait SharedMemory {
     /// Return the length of usable memory contained in `self`.
     /// The returned size does not include the size of the surrounding
     /// guard pages.
-    #[instrument(skip_all, parent = Span::current(), level= "Trace")]
     fn mem_size(&self) -> usize {
         self.region().size - 2 * PAGE_SIZE_USIZE
     }
@@ -840,7 +831,7 @@ impl HostSharedMemory {
         Ok(())
     }
 
-    /// /Copy the contents of the sandbox at the specified offset into
+    /// Copy the contents of the sandbox at the specified offset into
     /// the slice
     pub fn copy_from_slice(&self, slice: &[u8], offset: usize) -> Result<()> {
         bounds_check!(offset, slice.len(), self.mem_size());
@@ -885,7 +876,7 @@ impl HostSharedMemory {
         buffer_size: usize,
         data: &[u8],
     ) -> Result<()> {
-        let stack_pointer_rel = self.read::<u64>(buffer_start_offset).unwrap() as usize;
+        let stack_pointer_rel = self.read::<u64>(buffer_start_offset)? as usize;
         let buffer_size_u64: u64 = buffer_size.try_into()?;
 
         if stack_pointer_rel > buffer_size || stack_pointer_rel < 8 {
@@ -953,7 +944,7 @@ impl HostSharedMemory {
 
         // go back 8 bytes to get offset to element on top of stack
         let last_element_offset_rel: usize =
-            self.read::<u64>(last_element_offset_abs - 8).unwrap() as usize;
+            self.read::<u64>(last_element_offset_abs - 8)? as usize;
 
         // make it absolute
         let last_element_offset_abs = last_element_offset_rel + buffer_start_offset;

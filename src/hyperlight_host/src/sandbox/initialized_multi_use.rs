@@ -21,7 +21,7 @@ use hyperlight_common::flatbuffer_wrappers::function_types::{
 };
 use tracing::{instrument, Span};
 
-use super::host_funcs::HostFuncsWrapper;
+use super::host_funcs::FunctionRegistry;
 use super::{MemMgrWrapper, WrapperGetter};
 use crate::func::call_ctx::MultiUseGuestCallContext;
 use crate::func::guest_dispatch::call_function_on_guest;
@@ -41,7 +41,7 @@ use crate::Result;
 ///    in this case the state of the sandbox is not reset until the context is finished and the `MultiUseSandbox` is returned.
 pub struct MultiUseSandbox {
     // We need to keep a reference to the host functions, even if the compiler marks it as unused. The compiler cannot detect our dynamic usages of the host function in `HyperlightFunction::call`.
-    pub(super) _host_funcs: Arc<Mutex<HostFuncsWrapper>>,
+    pub(super) _host_funcs: Arc<Mutex<FunctionRegistry>>,
     pub(crate) mem_mgr: MemMgrWrapper<HostSharedMemory>,
     hv_handler: HypervisorHandler,
 }
@@ -73,7 +73,7 @@ impl MultiUseSandbox {
     /// (as a `From` implementation would be)
     #[instrument(skip_all, parent = Span::current(), level = "Trace")]
     pub(super) fn from_uninit(
-        host_funcs: Arc<Mutex<HostFuncsWrapper>>,
+        host_funcs: Arc<Mutex<FunctionRegistry>>,
         mgr: MemMgrWrapper<HostSharedMemory>,
         hv_handler: HypervisorHandler,
     ) -> MultiUseSandbox {
@@ -112,8 +112,6 @@ impl MultiUseSandbox {
     /// let u_sbox = UninitializedSandbox::new(
     ///     GuestBinary::FilePath("some_guest_binary".to_string()),
     ///     None,
-    ///     None,
-    ///     None,
     /// ).unwrap();
     /// let sbox: MultiUseSandbox = u_sbox.evolve(Noop::default()).unwrap();
     /// // Next, create a new call context from the single-use sandbox.
@@ -121,7 +119,7 @@ impl MultiUseSandbox {
     /// // original `sbox` variable.
     /// let mut ctx = sbox.new_call_context();
     ///
-    /// // Do a guest call with the context. Assues that the loaded binary
+    /// // Do a guest call with the context. Assumes that the loaded binary
     /// // ("some_guest_binary") has a function therein called "SomeGuestFunc"
     /// // that takes a single integer argument and returns an integer.
     /// match ctx.call(
@@ -240,7 +238,7 @@ where
     ///
     /// The evolve function creates a new MultiUseCallContext which is then passed to a callback function  allowing the
     /// callback function to call guest functions as part of the evolve process, once the callback function  is complete
-    /// the context is finished using a crate internal method that does not restore the prior state of the Sanbbox.
+    /// the context is finished using a crate internal method that does not restore the prior state of the Sandbox.
     /// It then creates a mew  memory snapshot on the snapshot stack and returns the MultiUseSandbox
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
     fn evolve(
@@ -278,9 +276,7 @@ mod tests {
 
         let sbox1: MultiUseSandbox = {
             let path = simple_guest_as_string().unwrap();
-            let u_sbox =
-                UninitializedSandbox::new(GuestBinary::FilePath(path), Some(cfg), None, None)
-                    .unwrap();
+            let u_sbox = UninitializedSandbox::new(GuestBinary::FilePath(path), Some(cfg)).unwrap();
             u_sbox.evolve(Noop::default())
         }
         .unwrap();
@@ -298,9 +294,7 @@ mod tests {
 
         let sbox2: MultiUseSandbox = {
             let path = simple_guest_as_string().unwrap();
-            let u_sbox =
-                UninitializedSandbox::new(GuestBinary::FilePath(path), Some(cfg), None, None)
-                    .unwrap();
+            let u_sbox = UninitializedSandbox::new(GuestBinary::FilePath(path), Some(cfg)).unwrap();
             u_sbox.evolve(Noop::default())
         }
         .unwrap();
@@ -325,8 +319,7 @@ mod tests {
     fn evolve_devolve_handles_state_correctly() {
         let sbox1: MultiUseSandbox = {
             let path = simple_guest_as_string().unwrap();
-            let u_sbox =
-                UninitializedSandbox::new(GuestBinary::FilePath(path), None, None, None).unwrap();
+            let u_sbox = UninitializedSandbox::new(GuestBinary::FilePath(path), None).unwrap();
             u_sbox.evolve(Noop::default())
         }
         .unwrap();

@@ -32,6 +32,7 @@ use crate::flatbuffers::hyperlight::generated::{
 };
 
 /// Supported parameter types with values for function calling.
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParameterValue {
     /// i32
@@ -98,12 +99,13 @@ pub enum ReturnValue {
     /// bool
     Bool(bool),
     /// ()
-    Void,
+    Void(()),
     /// Vec<u8>
     VecBytes(Vec<u8>),
 }
 
 /// Supported return types from function calling.
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 #[repr(C)]
 pub enum ReturnType {
@@ -506,7 +508,7 @@ impl TryFrom<ReturnValue> for () {
     #[cfg_attr(feature = "tracing", instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace"))]
     fn try_from(value: ReturnValue) -> Result<Self> {
         match value {
-            ReturnValue::Void => Ok(()),
+            ReturnValue::Void(()) => Ok(()),
             _ => {
                 bail!("Unexpected return value type: {:?}", value)
             }
@@ -568,7 +570,7 @@ impl TryFrom<FbFunctionCallResult<'_>> for ReturnValue {
                 };
                 Ok(ReturnValue::String(hlstring.unwrap_or("".to_string())))
             }
-            FbReturnValue::hlvoid => Ok(ReturnValue::Void),
+            FbReturnValue::hlvoid => Ok(ReturnValue::Void(())),
             FbReturnValue::hlsizeprefixedbuffer => {
                 let hlvecbytes =
                     match function_call_result_fb.return_value_as_hlsizeprefixedbuffer() {
@@ -708,7 +710,7 @@ impl TryFrom<&ReturnValue> for Vec<u8> {
                         &mut builder,
                         &hlsizeprefixedbufferArgs {
                             value: Some(val),
-                            size_: v.len() as i32,
+                            size: v.len() as i32,
                         },
                     )
                 };
@@ -722,7 +724,7 @@ impl TryFrom<&ReturnValue> for Vec<u8> {
                 builder.finish_size_prefixed(function_call_result, None);
                 builder.finished_data().to_vec()
             }
-            ReturnValue::Void => {
+            ReturnValue::Void(()) => {
                 let hlvoid = hlvoid::create(&mut builder, &hlvoidArgs {});
                 let function_call_result = FbFunctionCallResult::create(
                     &mut builder,

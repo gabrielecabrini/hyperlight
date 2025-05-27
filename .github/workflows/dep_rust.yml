@@ -48,9 +48,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: hyperlight-dev/ci-setup-workflow@v1.2.0
+      # For rust-fmt 
+      - name: Set up nightly rust 
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          rust-toolchain: "nightly"
+          components: rustfmt
+
+      - uses: hyperlight-dev/ci-setup-workflow@v1.3.0
+        with:
+          rust-toolchain: "1.81.0" 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -58,7 +64,9 @@ jobs:
         run: just fmt-check
 
       - name: clippy
-        run: just clippy ${{ matrix.config }}
+        run: |
+          just clippy ${{ matrix.config }}
+          just clippy-guests ${{ matrix.config }}
 
       # Does not check for updated Cargo.lock files for test rust guests as this causes an issue with this checkwhen deoendabot updates dependencies in common crates
       - name: Ensure up-to-date Cargo.lock
@@ -71,13 +79,18 @@ jobs:
         shell: pwsh
 
       - name: Build and move Rust guests
-        run: just build-and-move-rust-guests
+        run: |
+          # use these commands in favor of build-and-move-rust-guests to avoid building both configs
+          just build-rust-guests ${{ matrix.config }}
+          just move-rust-guests ${{ matrix.config }}
 
       - name: Build c guests
-        run: just build-and-move-c-guests
-
+        run: |
+          # use these commands in favor of build-and-move-c-guests to avoid building both configs
+          just build-c-guests ${{ matrix.config }}
+          just move-c-guests ${{ matrix.config }}
       - name: Build
-        run: just build-rust ${{ matrix.config }}
+        run: just build ${{ matrix.config }}
 
       - name: Verify MSRV
         run: ./dev/verify-msrv.sh hyperlight-host hyperlight-guest hyperlight-common
@@ -87,17 +100,18 @@ jobs:
           CARGO_TERM_COLOR: always
         run: |
           # with default features
-          just test-rust ${{ matrix.config }} ${{ matrix.hypervisor == 'mshv3' && 'mshv3' || ''}}
+          just test ${{ matrix.config }} ${{ matrix.hypervisor == 'mshv3' && 'mshv3' || ''}}
 
-          # with only one driver enabled (driver mshv/kvm feature is ignored on windows) + seccomp + inprocess
-          just test-rust ${{ matrix.config }} inprocess,seccomp,${{ matrix.hypervisor == 'mshv' && 'mshv2' || matrix.hypervisor == 'mshv3' && 'mshv3' || 'kvm' }} 
+          # with only one driver enabled (driver mshv/kvm feature is ignored on windows) + seccomp 
+          just test ${{ matrix.config }} seccomp,${{ matrix.hypervisor == 'mshv' && 'mshv2' || matrix.hypervisor == 'mshv3' && 'mshv3' || 'kvm' }} 
 
           # make sure certain cargo features compile
           cargo check -p hyperlight-host --features crashdump
           cargo check -p hyperlight-host --features print_debug
+          cargo check -p hyperlight-host --features gdb
 
           # without any driver (shouldn't compile)
-          just test-rust-feature-compilation-fail ${{ matrix.config }}
+          just test-compilation-fail ${{ matrix.config }}
 
         # One of the examples is flaky on Windows GH runners, so this allows us to disable it for now
       - name: Run Rust examples - windows
@@ -113,6 +127,13 @@ jobs:
           CARGO_TERM_COLOR: always
           RUST_LOG: debug
         run: just run-rust-examples-linux ${{ matrix.config }} ${{ matrix.hypervisor == 'mshv3' && 'mshv3' || ''}}
+
+      - name: Run Rust Gdb tests - linux
+        if: runner.os == 'Linux'
+        env:
+          CARGO_TERM_COLOR: always
+          RUST_LOG: debug
+        run: just test-rust-gdb-debugging ${{ matrix.config }} ${{ matrix.hypervisor == 'mshv3' && 'mshv3' || ''}}
 
       ### Benchmarks ###
       - name: Install github-cli (Linux mariner)

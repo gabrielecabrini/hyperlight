@@ -25,7 +25,7 @@ use crate::{new_error, Result};
 /// has initiated an outb operation.
 pub trait OutBHandlerCaller: Sync + Send {
     /// Function that gets called when an outb operation has occurred.
-    fn call(&mut self, port: u16, payload: u64) -> Result<()>;
+    fn call(&mut self, port: u16, payload: u32) -> Result<()>;
 }
 
 /// A convenient type representing a common way `OutBHandler` implementations
@@ -36,7 +36,7 @@ pub trait OutBHandlerCaller: Sync + Send {
 /// a &mut self).
 pub type OutBHandlerWrapper = Arc<Mutex<dyn OutBHandlerCaller>>;
 
-pub(crate) type OutBHandlerFunction = Box<dyn FnMut(u16, u64) -> Result<()> + Send>;
+pub(crate) type OutBHandlerFunction = Box<dyn FnMut(u16, u32) -> Result<()> + Send>;
 
 /// A `OutBHandler` implementation using a `OutBHandlerFunction`
 ///
@@ -52,7 +52,7 @@ impl From<OutBHandlerFunction> for OutBHandler {
 
 impl OutBHandlerCaller for OutBHandler {
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
-    fn call(&mut self, port: u16, payload: u64) -> Result<()> {
+    fn call(&mut self, port: u16, payload: u32) -> Result<()> {
         let mut func = self
             .0
             .try_lock()
@@ -102,3 +102,25 @@ impl MemAccessHandlerCaller for MemAccessHandler {
         func()
     }
 }
+
+/// The trait representing custom logic to handle the case when
+/// a Hypervisor's virtual CPU (vCPU) informs Hyperlight a debug memory access
+/// has been requested.
+#[cfg(gdb)]
+pub trait DbgMemAccessHandlerCaller: Send {
+    /// Function that gets called when a read is requested.
+    fn read(&mut self, addr: usize, data: &mut [u8]) -> Result<()>;
+
+    /// Function that gets called when a write is requested.
+    fn write(&mut self, addr: usize, data: &[u8]) -> Result<()>;
+
+    /// Function that gets called for a request to get guest code offset.
+    fn get_code_offset(&mut self) -> Result<usize>;
+}
+
+/// A convenient type representing an implementer of `DbgMemAccessHandlerCaller`
+///
+/// Note: This needs to be wrapped in a Mutex to be able to grab a mutable
+/// reference to the underlying data
+#[cfg(gdb)]
+pub type DbgMemAccessHandlerWrapper = Arc<Mutex<dyn DbgMemAccessHandlerCaller>>;

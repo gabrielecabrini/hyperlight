@@ -131,28 +131,16 @@ pub enum MemoryRegionType {
     Code,
     /// The region contains the PEB
     Peb,
-    /// The region contains the Host Function Definitions
-    HostFunctionDefinitions,
-    /// The region contains the Host Exception Data
-    HostExceptionData,
-    /// The region contains the Guest Error Data
-    GuestErrorData,
     /// The region contains the Input Data
     InputData,
     /// The region contains the Output Data
     OutputData,
-    /// The region contains the Panic Context
-    PanicContext,
     /// The region contains the Heap
     Heap,
     /// The region contains the Guard Page
     GuardPage,
     /// The region contains the Stack
     Stack,
-    /// The region contains the Kernel Stack
-    KernelStack,
-    /// The region contains the Boot Stack
-    BootStack,
 }
 
 /// represents a single memory region inside the guest. All memory within a region has
@@ -202,6 +190,8 @@ impl MemoryRegionVecBuilder {
             return guest_end - self.guest_base_phys_addr;
         }
 
+        #[allow(clippy::unwrap_used)]
+        // we know this is safe because we check if the regions are empty above
         let last_region = self.regions.last().unwrap();
         let new_region = MemoryRegion {
             guest_region: last_region.guest_region.end..last_region.guest_region.end + size,

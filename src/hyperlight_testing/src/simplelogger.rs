@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // this is a non threadsafe logger for testing purposes, to test the log messages emitted by the guest.
-// it will only log messages from the hyperlight-guest target. It will not log messages from other targets.
+// it will only log messages from the hyperlight_guest target. It will not log messages from other targets.
 // this target is only used when handling an outb log request from the guest, so this logger will only capture those messages.
 
 use std::sync::Once;
@@ -80,13 +80,13 @@ impl Log for SimpleLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         // This allows us to count the actual number of messages that have been logged by the guest
         // because the guest derives its log level from the host log level then the number times that enabled is called for
-        // the "hyperlight-guest" target will be the same as the number of messages logged by the guest.
-        // In other words this function should always return true for the "hyperlight-guest" target.
+        // the "hyperlight_guest" target will be the same as the number of messages logged by the guest.
+        // In other words this function should always return true for the "hyperlight_guest" target.
         unsafe {
-            if metadata.target() == "hyperlight-guest" {
+            if metadata.target() == "hyperlight_guest" {
                 NUMBER_OF_ENABLED_CALLS += 1;
             }
-            metadata.target() == "hyperlight-guest" && metadata.level() <= log::max_level()
+            metadata.target() == "hyperlight_guest" && metadata.level() <= log::max_level()
         }
     }
     fn log(&self, record: &Record) {

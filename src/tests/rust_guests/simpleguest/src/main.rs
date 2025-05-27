@@ -26,9 +26,9 @@ const MAX_BUFFER_SIZE: usize = 1024;
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
+use alloc::{format, vec};
 use core::ffi::c_char;
 use core::hint::black_box;
 use core::ptr::write_volatile;
@@ -39,20 +39,13 @@ use hyperlight_common::flatbuffer_wrappers::function_types::{
 };
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
-use hyperlight_common::flatbuffer_wrappers::util::{
-    get_flatbuffer_result_from_double, get_flatbuffer_result_from_float,
-    get_flatbuffer_result_from_int, get_flatbuffer_result_from_string,
-    get_flatbuffer_result_from_ulong, get_flatbuffer_result_from_vec,
-    get_flatbuffer_result_from_void,
-};
+use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result;
 use hyperlight_common::mem::PAGE_SIZE;
 use hyperlight_guest::entrypoint::{abort_with_code, abort_with_code_and_message};
 use hyperlight_guest::error::{HyperlightGuestError, Result};
 use hyperlight_guest::guest_function_definition::GuestFunctionDefinition;
 use hyperlight_guest::guest_function_register::register_function;
-use hyperlight_guest::host_function_call::{
-    call_host_function, get_host_value_return_as_int, get_host_value_return_as_ulong,
-};
+use hyperlight_guest::host_function_call::{call_host_function, call_host_function_internal};
 use hyperlight_guest::memory::malloc;
 use hyperlight_guest::{logging, MIN_STACK_ADDRESS};
 use log::{error, LevelFilter};
@@ -61,19 +54,18 @@ extern crate hyperlight_guest;
 
 static mut BIGARRAY: [i32; 1024 * 1024] = [0; 1024 * 1024];
 
-fn set_static() -> Result<Vec<u8>> {
+fn set_static(_: &FunctionCall) -> Result<Vec<u8>> {
     unsafe {
-        let length = BIGARRAY.len();
-        for i in 0..length {
-            BIGARRAY[i] = i as i32;
+        for val in BIGARRAY.iter_mut() {
+            *val = 1;
         }
-        Ok(get_flatbuffer_result_from_int(length as i32))
+        Ok(get_flatbuffer_result(BIGARRAY.len() as i32))
     }
 }
 
 fn echo_double(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::Double(value) = function_call.parameters.clone().unwrap()[0].clone() {
-        Ok(get_flatbuffer_result_from_double(value))
+        Ok(get_flatbuffer_result(value))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -84,7 +76,7 @@ fn echo_double(function_call: &FunctionCall) -> Result<Vec<u8>> {
 
 fn echo_float(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::Float(value) = function_call.parameters.clone().unwrap()[0].clone() {
-        Ok(get_flatbuffer_result_from_float(value))
+        Ok(get_flatbuffer_result(value))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -94,13 +86,13 @@ fn echo_float(function_call: &FunctionCall) -> Result<Vec<u8>> {
 }
 
 fn print_output(message: &str) -> Result<Vec<u8>> {
-    call_host_function(
+    let res = call_host_function::<i32>(
         "HostPrint",
         Some(Vec::from(&[ParameterValue::String(message.to_string())])),
         ReturnType::Int,
     )?;
-    let result = get_host_value_return_as_int()?;
-    Ok(get_flatbuffer_result_from_int(result))
+
+    Ok(get_flatbuffer_result(res))
 }
 
 fn simple_print_output(function_call: &FunctionCall) -> Result<Vec<u8>> {
@@ -118,7 +110,7 @@ fn set_byte_array_to_zero(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::VecBytes(mut vec) = function_call.parameters.clone().unwrap()[0].clone()
     {
         vec.fill(0);
-        Ok(get_flatbuffer_result_from_vec(&vec))
+        Ok(get_flatbuffer_result(&*vec))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -403,7 +395,7 @@ fn print_eleven_args(function_call: &FunctionCall) -> Result<Vec<u8>> {
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
-            "Invalid parameters passed to print_ten_args".to_string(),
+            "Invalid parameters passed to print_eleven_args".to_string(),
         ))
     }
 }
@@ -420,7 +412,7 @@ fn buffer_overrun(function_call: &FunctionCall) -> Result<Vec<u8>> {
 
         let result = (17i32).saturating_sub(length as i32);
 
-        Ok(get_flatbuffer_result_from_int(result))
+        Ok(get_flatbuffer_result(result))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -430,19 +422,19 @@ fn buffer_overrun(function_call: &FunctionCall) -> Result<Vec<u8>> {
 }
 
 #[allow(unconditional_recursion)]
-fn infinite_recursion(a: &FunctionCall) -> Result<Vec<u8>> {
+fn infinite_recursion(_a: &FunctionCall) -> Result<Vec<u8>> {
     // blackbox is needed so something
     //is written to the stack in release mode,
     //to trigger guard page violation
     let param = black_box(5);
     black_box(param);
-    infinite_recursion(a)
+    infinite_recursion(_a)
 }
 
 fn stack_overflow(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::Int(i) = function_call.parameters.clone().unwrap()[0].clone() {
         loop_stack_overflow(i);
-        Ok(get_flatbuffer_result_from_int(i))
+        Ok(get_flatbuffer_result(i))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -460,12 +452,12 @@ fn loop_stack_overflow(i: i32) {
 
 fn large_var(_: &FunctionCall) -> Result<Vec<u8>> {
     let _buffer = black_box([0u8; (DEFAULT_GUEST_STACK_SIZE + 1) as usize]);
-    Ok(get_flatbuffer_result_from_int(DEFAULT_GUEST_STACK_SIZE + 1))
+    Ok(get_flatbuffer_result(DEFAULT_GUEST_STACK_SIZE + 1))
 }
 
 fn small_var(_: &FunctionCall) -> Result<Vec<u8>> {
     let _buffer = black_box([0u8; 1024]);
-    Ok(get_flatbuffer_result_from_int(1024))
+    Ok(get_flatbuffer_result(1024))
 }
 
 fn call_malloc(function_call: &FunctionCall) -> Result<Vec<u8>> {
@@ -473,7 +465,7 @@ fn call_malloc(function_call: &FunctionCall) -> Result<Vec<u8>> {
         // will panic if OOM, and we need blackbox to avoid optimizing away this test
         let buffer = Vec::<u8>::with_capacity(size as usize);
         black_box(buffer);
-        Ok(get_flatbuffer_result_from_int(size))
+        Ok(get_flatbuffer_result(size))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -489,11 +481,10 @@ fn malloc_and_free(function_call: &FunctionCall) -> Result<Vec<u8>> {
         } else {
             size.min(MAX_BUFFER_SIZE as i32)
         };
-        let mut allocated_buffer = Vec::with_capacity(alloc_length as usize);
-        allocated_buffer.resize(alloc_length as usize, 0);
+        let allocated_buffer = vec![0; alloc_length as usize];
         drop(allocated_buffer);
 
-        Ok(get_flatbuffer_result_from_int(size))
+        Ok(get_flatbuffer_result(size))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -504,7 +495,7 @@ fn malloc_and_free(function_call: &FunctionCall) -> Result<Vec<u8>> {
 
 fn echo(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::String(value) = function_call.parameters.clone().unwrap()[0].clone() {
-        Ok(get_flatbuffer_result_from_string(&value))
+        Ok(get_flatbuffer_result(&*value))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -515,7 +506,7 @@ fn echo(function_call: &FunctionCall) -> Result<Vec<u8>> {
 
 fn get_size_prefixed_buffer(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::VecBytes(data) = function_call.parameters.clone().unwrap()[0].clone() {
-        Ok(get_flatbuffer_result_from_vec(&data))
+        Ok(get_flatbuffer_result(&*data))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -524,20 +515,24 @@ fn get_size_prefixed_buffer(function_call: &FunctionCall) -> Result<Vec<u8>> {
     }
 }
 
+#[expect(
+    clippy::empty_loop,
+    reason = "This function is used to keep the CPU busy"
+)]
 fn spin(_: &FunctionCall) -> Result<Vec<u8>> {
     loop {
         // Keep the CPU 100% busy forever
     }
 
     #[allow(unreachable_code)]
-    Ok(get_flatbuffer_result_from_void())
+    Ok(get_flatbuffer_result(()))
 }
 
 fn test_abort(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::Int(code) = function_call.parameters.clone().unwrap()[0].clone() {
-        abort_with_code(code);
+        abort_with_code(&[code as u8]);
     }
-    Ok(get_flatbuffer_result_from_void())
+    Ok(get_flatbuffer_result(()))
 }
 
 fn test_abort_with_code_and_message(function_call: &FunctionCall) -> Result<Vec<u8>> {
@@ -546,17 +541,17 @@ fn test_abort_with_code_and_message(function_call: &FunctionCall) -> Result<Vec<
         function_call.parameters.clone().unwrap()[1].clone(),
     ) {
         unsafe {
-            abort_with_code_and_message(code, message.as_ptr() as *const c_char);
+            abort_with_code_and_message(&[code as u8], message.as_ptr() as *const c_char);
         }
     }
-    Ok(get_flatbuffer_result_from_void())
+    Ok(get_flatbuffer_result(()))
 }
 
 fn test_guest_panic(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::String(message) = function_call.parameters.clone().unwrap()[0].clone() {
         panic!("{}", message);
     }
-    Ok(get_flatbuffer_result_from_void())
+    Ok(get_flatbuffer_result(()))
 }
 
 fn test_write_raw_ptr(function_call: &FunctionCall) -> Result<Vec<u8>> {
@@ -577,9 +572,9 @@ fn test_write_raw_ptr(function_call: &FunctionCall) -> Result<Vec<u8>> {
             // print_output(format!("writing to {:#x}\n", addr).as_str()).unwrap();
             write_volatile(addr as *mut u8, 0u8);
         }
-        return Ok(get_flatbuffer_result_from_string("success"));
+        return Ok(get_flatbuffer_result("success"));
     }
-    Ok(get_flatbuffer_result_from_string("fail"))
+    Ok(get_flatbuffer_result("fail"))
 }
 
 fn execute_on_stack(_function_call: &FunctionCall) -> Result<Vec<u8>> {
@@ -588,7 +583,7 @@ fn execute_on_stack(_function_call: &FunctionCall) -> Result<Vec<u8>> {
         let stack_fn: fn() = core::mem::transmute(&mut noop as *mut u8);
         stack_fn();
     };
-    Ok(get_flatbuffer_result_from_string("fail"))
+    Ok(get_flatbuffer_result("fail"))
 }
 
 fn execute_on_heap(_function_call: &FunctionCall) -> Result<Vec<u8>> {
@@ -600,13 +595,13 @@ fn execute_on_heap(_function_call: &FunctionCall) -> Result<Vec<u8>> {
         black_box(heap_fn); // avoid optimization when running in release mode
     }
     // will only reach this point if heap is executable
-    Ok(get_flatbuffer_result_from_string("fail"))
+    Ok(get_flatbuffer_result("fail"))
 }
 
 fn test_rust_malloc(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::Int(code) = function_call.parameters.clone().unwrap()[0].clone() {
         let ptr = unsafe { malloc(code as usize) };
-        Ok(get_flatbuffer_result_from_int(ptr as i32))
+        Ok(get_flatbuffer_result(ptr as i32))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -628,13 +623,20 @@ fn log_message(function_call: &FunctionCall) -> Result<Vec<u8>> {
                 // was passed LevelFilter::Off, do nothing
             }
         }
-        Ok(get_flatbuffer_result_from_void())
+        Ok(get_flatbuffer_result(()))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
             "Invalid parameters passed to log_message".to_string(),
         ))
     }
+}
+
+fn trigger_exception(_: &FunctionCall) -> Result<Vec<u8>> {
+    unsafe {
+        core::arch::asm!("ud2");
+    } // trigger an undefined instruction exception
+    Ok(get_flatbuffer_result(()))
 }
 
 static mut COUNTER: i32 = 0;
@@ -645,7 +647,7 @@ fn add_to_static(function_call: &FunctionCall) -> Result<Vec<u8>> {
             COUNTER += i;
             COUNTER
         };
-        Ok(get_flatbuffer_result_from_int(res))
+        Ok(get_flatbuffer_result(res))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -656,7 +658,7 @@ fn add_to_static(function_call: &FunctionCall) -> Result<Vec<u8>> {
 
 fn get_static(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if function_call.parameters.is_none() {
-        Ok(get_flatbuffer_result_from_int(unsafe { COUNTER }))
+        Ok(get_flatbuffer_result(unsafe { COUNTER }))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -677,11 +679,9 @@ fn add_to_static_and_fail(_: &FunctionCall) -> Result<Vec<u8>> {
 
 fn violate_seccomp_filters(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if function_call.parameters.is_none() {
-        call_host_function("MakeGetpidSyscall", None, ReturnType::ULong)?;
+        let res = call_host_function::<u64>("MakeGetpidSyscall", None, ReturnType::ULong)?;
 
-        let res = get_host_value_return_as_ulong()?;
-
-        Ok(get_flatbuffer_result_from_ulong(res))
+        Ok(get_flatbuffer_result(res))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
@@ -695,19 +695,32 @@ fn add(function_call: &FunctionCall) -> Result<Vec<u8>> {
         function_call.parameters.clone().unwrap()[0].clone(),
         function_call.parameters.clone().unwrap()[1].clone(),
     ) {
-        call_host_function(
+        let res = call_host_function::<i32>(
             "HostAdd",
             Some(Vec::from(&[ParameterValue::Int(a), ParameterValue::Int(b)])),
             ReturnType::Int,
         )?;
-
-        let res = get_host_value_return_as_int()?;
-
-        Ok(get_flatbuffer_result_from_int(res))
+        Ok(get_flatbuffer_result(res))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestFunctionParameterTypeMismatch,
             "Invalid parameters passed to add".to_string(),
+        ))
+    }
+}
+
+// Does nothing, but used for testing large parameters
+fn large_parameters(function_call: &FunctionCall) -> Result<Vec<u8>> {
+    if let (ParameterValue::VecBytes(v), ParameterValue::String(s)) = (
+        function_call.parameters.clone().unwrap()[0].clone(),
+        function_call.parameters.clone().unwrap()[1].clone(),
+    ) {
+        black_box((v, s));
+        Ok(get_flatbuffer_result(()))
+    } else {
+        Err(HyperlightGuestError::new(
+            ErrorCode::GuestFunctionParameterTypeMismatch,
+            "Invalid parameters passed to large_parameters".to_string(),
         ))
     }
 }
@@ -718,7 +731,7 @@ pub extern "C" fn hyperlight_main() {
         "SetStatic".to_string(),
         Vec::new(),
         ReturnType::Int,
-        set_static as i64,
+        set_static as usize,
     );
 
     register_function(set_static_def);
@@ -727,7 +740,7 @@ pub extern "C" fn hyperlight_main() {
         "PrintOutput".to_string(),
         Vec::from(&[ParameterType::String]),
         ReturnType::Int,
-        simple_print_output as i64,
+        simple_print_output as usize,
     );
     register_function(simple_print_output_def);
 
@@ -735,7 +748,7 @@ pub extern "C" fn hyperlight_main() {
         "PrintUsingPrintf".to_string(),
         Vec::from(&[ParameterType::String]),
         ReturnType::Int,
-        simple_print_output as i64, // alias to simple_print_output for now
+        simple_print_output as usize, // alias to simple_print_output for now
     );
     register_function(print_using_printf_def);
 
@@ -743,7 +756,7 @@ pub extern "C" fn hyperlight_main() {
         "StackOverflow".to_string(),
         Vec::from(&[ParameterType::Int]),
         ReturnType::Int,
-        stack_overflow as i64,
+        stack_overflow as usize,
     );
     register_function(stack_overflow_def);
 
@@ -751,7 +764,7 @@ pub extern "C" fn hyperlight_main() {
         "BufferOverrun".to_string(),
         Vec::from(&[ParameterType::String]),
         ReturnType::Int,
-        buffer_overrun as i64,
+        buffer_overrun as usize,
     );
     register_function(buffer_overrun_def);
 
@@ -759,7 +772,7 @@ pub extern "C" fn hyperlight_main() {
         "LargeVar".to_string(),
         Vec::new(),
         ReturnType::Int,
-        large_var as i64,
+        large_var as usize,
     );
     register_function(large_var_def);
 
@@ -767,7 +780,7 @@ pub extern "C" fn hyperlight_main() {
         "SmallVar".to_string(),
         Vec::new(),
         ReturnType::Int,
-        small_var as i64,
+        small_var as usize,
     );
     register_function(small_var_def);
 
@@ -775,7 +788,7 @@ pub extern "C" fn hyperlight_main() {
         "CallMalloc".to_string(),
         Vec::from(&[ParameterType::Int]),
         ReturnType::Int,
-        call_malloc as i64,
+        call_malloc as usize,
     );
     register_function(call_malloc_def);
 
@@ -783,7 +796,7 @@ pub extern "C" fn hyperlight_main() {
         "MallocAndFree".to_string(),
         Vec::from(&[ParameterType::Int]),
         ReturnType::Int,
-        malloc_and_free as i64,
+        malloc_and_free as usize,
     );
     register_function(malloc_and_free_def);
 
@@ -791,7 +804,7 @@ pub extern "C" fn hyperlight_main() {
         "PrintTwoArgs".to_string(),
         Vec::from(&[ParameterType::String, ParameterType::Int]),
         ReturnType::Int,
-        print_two_args as i64,
+        print_two_args as usize,
     );
     register_function(print_two_args_def);
 
@@ -803,7 +816,7 @@ pub extern "C" fn hyperlight_main() {
             ParameterType::Long,
         ]),
         ReturnType::Int,
-        print_three_args as i64,
+        print_three_args as usize,
     );
     register_function(print_three_args_def);
 
@@ -816,7 +829,7 @@ pub extern "C" fn hyperlight_main() {
             ParameterType::String,
         ]),
         ReturnType::Int,
-        print_four_args as i64,
+        print_four_args as usize,
     );
     register_function(print_four_args_def);
 
@@ -830,7 +843,7 @@ pub extern "C" fn hyperlight_main() {
             ParameterType::String,
         ]),
         ReturnType::Int,
-        print_five_args as i64,
+        print_five_args as usize,
     );
     register_function(print_five_args_def);
 
@@ -845,7 +858,7 @@ pub extern "C" fn hyperlight_main() {
             ParameterType::Bool,
         ]),
         ReturnType::Int,
-        print_six_args as i64,
+        print_six_args as usize,
     );
     register_function(print_six_args_def);
 
@@ -861,7 +874,7 @@ pub extern "C" fn hyperlight_main() {
             ParameterType::Bool,
         ]),
         ReturnType::Int,
-        print_seven_args as i64,
+        print_seven_args as usize,
     );
     register_function(print_seven_args_def);
 
@@ -878,7 +891,7 @@ pub extern "C" fn hyperlight_main() {
             ParameterType::UInt,
         ]),
         ReturnType::Int,
-        print_eight_args as i64,
+        print_eight_args as usize,
     );
     register_function(print_eight_args_def);
 
@@ -896,7 +909,7 @@ pub extern "C" fn hyperlight_main() {
             ParameterType::ULong,
         ]),
         ReturnType::Int,
-        print_nine_args as i64,
+        print_nine_args as usize,
     );
     register_function(print_nine_args_def);
 
@@ -915,7 +928,7 @@ pub extern "C" fn hyperlight_main() {
             ParameterType::Int,
         ]),
         ReturnType::Int,
-        print_ten_args as i64,
+        print_ten_args as usize,
     );
     register_function(print_ten_args_def);
 
@@ -935,7 +948,7 @@ pub extern "C" fn hyperlight_main() {
             ParameterType::Float,
         ]),
         ReturnType::Int,
-        print_eleven_args as i64,
+        print_eleven_args as usize,
     );
     register_function(print_eleven_args_def);
 
@@ -943,7 +956,7 @@ pub extern "C" fn hyperlight_main() {
         "SetByteArrayToZero".to_string(),
         Vec::from(&[ParameterType::VecBytes]),
         ReturnType::VecBytes,
-        set_byte_array_to_zero as i64,
+        set_byte_array_to_zero as usize,
     );
     register_function(set_byte_array_to_zero_def);
 
@@ -951,7 +964,7 @@ pub extern "C" fn hyperlight_main() {
         "Echo".to_string(),
         Vec::from(&[ParameterType::String]),
         ReturnType::String,
-        echo as i64,
+        echo as usize,
     );
     register_function(echo_def);
 
@@ -959,19 +972,23 @@ pub extern "C" fn hyperlight_main() {
         "GetSizePrefixedBuffer".to_string(),
         Vec::from(&[ParameterType::VecBytes]),
         ReturnType::Int,
-        get_size_prefixed_buffer as i64,
+        get_size_prefixed_buffer as usize,
     );
     register_function(get_size_prefixed_buffer_def);
 
-    let spin_def =
-        GuestFunctionDefinition::new("Spin".to_string(), Vec::new(), ReturnType::Int, spin as i64);
+    let spin_def = GuestFunctionDefinition::new(
+        "Spin".to_string(),
+        Vec::new(),
+        ReturnType::Int,
+        spin as usize,
+    );
     register_function(spin_def);
 
     let abort_def = GuestFunctionDefinition::new(
         "GuestAbortWithCode".to_string(),
         Vec::from(&[ParameterType::Int]),
         ReturnType::Void,
-        test_abort as i64,
+        test_abort as usize,
     );
     register_function(abort_def);
 
@@ -979,7 +996,7 @@ pub extern "C" fn hyperlight_main() {
         "GuestAbortWithMessage".to_string(),
         Vec::from(&[ParameterType::Int, ParameterType::String]),
         ReturnType::Void,
-        test_abort_with_code_and_message as i64,
+        test_abort_with_code_and_message as usize,
     );
     register_function(abort_with_code_message_def);
 
@@ -987,7 +1004,7 @@ pub extern "C" fn hyperlight_main() {
         "guest_panic".to_string(),
         Vec::from(&[ParameterType::String]),
         ReturnType::Void,
-        test_guest_panic as i64,
+        test_guest_panic as usize,
     );
     register_function(guest_panic_def);
 
@@ -995,7 +1012,7 @@ pub extern "C" fn hyperlight_main() {
         "TestMalloc".to_string(),
         Vec::from(&[ParameterType::Int]),
         ReturnType::Int,
-        test_rust_malloc as i64,
+        test_rust_malloc as usize,
     );
     register_function(rust_malloc_def);
 
@@ -1003,7 +1020,7 @@ pub extern "C" fn hyperlight_main() {
         "LogMessage".to_string(),
         Vec::from(&[ParameterType::String, ParameterType::Int]),
         ReturnType::Void,
-        log_message as i64,
+        log_message as usize,
     );
     register_function(log_message_def);
 
@@ -1011,7 +1028,7 @@ pub extern "C" fn hyperlight_main() {
         "InfiniteRecursion".to_string(),
         Vec::new(),
         ReturnType::Void,
-        infinite_recursion as i64,
+        infinite_recursion as usize,
     );
     register_function(infinite_recursion_def);
 
@@ -1019,7 +1036,7 @@ pub extern "C" fn hyperlight_main() {
         "test_write_raw_ptr".to_string(),
         Vec::from(&[ParameterType::Long]),
         ReturnType::String,
-        test_write_raw_ptr as i64,
+        test_write_raw_ptr as usize,
     );
     register_function(test_write_raw_ptr_def);
 
@@ -1027,7 +1044,7 @@ pub extern "C" fn hyperlight_main() {
         "ExecuteOnStack".to_string(),
         Vec::new(),
         ReturnType::String,
-        execute_on_stack as i64,
+        execute_on_stack as usize,
     );
     register_function(execute_on_stack_def);
 
@@ -1035,7 +1052,7 @@ pub extern "C" fn hyperlight_main() {
         "ExecuteOnHeap".to_string(),
         Vec::new(),
         ReturnType::String,
-        execute_on_heap as i64,
+        execute_on_heap as usize,
     );
     register_function(execute_on_heap_def);
 
@@ -1043,7 +1060,7 @@ pub extern "C" fn hyperlight_main() {
         "AddToStatic".to_string(),
         Vec::from(&[ParameterType::Int]),
         ReturnType::Int,
-        add_to_static as i64,
+        add_to_static as usize,
     );
     register_function(add_to_static_def);
 
@@ -1051,7 +1068,7 @@ pub extern "C" fn hyperlight_main() {
         "GetStatic".to_string(),
         Vec::new(),
         ReturnType::Int,
-        get_static as i64,
+        get_static as usize,
     );
     register_function(get_static_def);
 
@@ -1059,7 +1076,7 @@ pub extern "C" fn hyperlight_main() {
         "AddToStaticAndFail".to_string(),
         Vec::new(),
         ReturnType::Int,
-        add_to_static_and_fail as i64,
+        add_to_static_and_fail as usize,
     );
     register_function(add_to_static_and_fail_def);
 
@@ -1067,7 +1084,7 @@ pub extern "C" fn hyperlight_main() {
         "ViolateSeccompFilters".to_string(),
         Vec::new(),
         ReturnType::ULong,
-        violate_seccomp_filters as i64,
+        violate_seccomp_filters as usize,
     );
     register_function(violate_seccomp_filters_def);
 
@@ -1075,7 +1092,7 @@ pub extern "C" fn hyperlight_main() {
         "EchoFloat".to_string(),
         Vec::from(&[ParameterType::Float]),
         ReturnType::Float,
-        echo_float as i64,
+        echo_float as usize,
     );
     register_function(echo_float_def);
 
@@ -1083,7 +1100,7 @@ pub extern "C" fn hyperlight_main() {
         "EchoDouble".to_string(),
         Vec::from(&[ParameterType::Double]),
         ReturnType::Double,
-        echo_double as i64,
+        echo_double as usize,
     );
     register_function(echo_double_def);
 
@@ -1091,9 +1108,25 @@ pub extern "C" fn hyperlight_main() {
         "Add".to_string(),
         Vec::from(&[ParameterType::Int, ParameterType::Int]),
         ReturnType::Int,
-        add as i64,
+        add as usize,
     );
     register_function(add_def);
+
+    let trigger_exception_def = GuestFunctionDefinition::new(
+        "TriggerException".to_string(),
+        Vec::new(),
+        ReturnType::Void,
+        trigger_exception as usize,
+    );
+    register_function(trigger_exception_def);
+
+    let large_parameters_def = GuestFunctionDefinition::new(
+        "LargeParameters".to_string(),
+        Vec::from(&[ParameterType::VecBytes, ParameterType::String]),
+        ReturnType::Void,
+        large_parameters as usize,
+    );
+    register_function(large_parameters_def);
 }
 
 #[no_mangle]
@@ -1103,24 +1136,26 @@ pub fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>> {
     // If the stack is not working correctly, the input or output buffer will be
     // overwritten before the function call is serialized, and we will not be able
     // to verify that the function call name is "ThisIsNotARealFunctionButTheNameIsImportant"
+    if function_call.function_name == "FuzzHostFunc" {
+        return fuzz_host_function(function_call);
+    }
 
     let message = "Hi this is a log message that will overwrite the shared buffer if the stack is not working correctly";
 
     logging::log_message(
         LogLevel::Information,
-        &message,
+        message,
         "source",
         "caller",
         "file",
         1,
     );
 
-    call_host_function(
+    let result = call_host_function::<i32>(
         "HostPrint",
         Some(Vec::from(&[ParameterValue::String(message.to_string())])),
         ReturnType::Int,
     )?;
-    let result = get_host_value_return_as_int()?;
     let function_name = function_call.function_name.clone();
     let param_len = function_call.parameters.clone().unwrap_or_default().len();
     let call_type = function_call.function_call_type().clone();
@@ -1136,5 +1171,30 @@ pub fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>> {
         ));
     }
 
-    Ok(get_flatbuffer_result_from_int(99))
+    Ok(get_flatbuffer_result(99))
+}
+
+// Interprets the given guest function call as a host function call and dispatches it to the host.
+fn fuzz_host_function(func: FunctionCall) -> Result<Vec<u8>> {
+    let mut params = func.parameters.unwrap();
+    // first parameter must be string (the name of the host function to call)
+    let host_func_name = match params.remove(0) {
+        // TODO use `swap_remove` instead of `remove` if performance is an issue, but left out
+        // to avoid confusion for replicating failure cases
+        ParameterValue::String(name) => name,
+        _ => {
+            return Err(HyperlightGuestError::new(
+                ErrorCode::GuestFunctionParameterTypeMismatch,
+                "Invalid parameters passed to fuzz_host_function".to_string(),
+            ))
+        }
+    };
+
+    // Because we do not know at compile time the actual return type of the host function to be called
+    // we cannot use the `call_host_function<T>` generic function.
+    // We need to use the `call_host_function_internal` function that does not retrieve the return
+    // value
+    call_host_function_internal(&host_func_name, Some(params), func.expected_return_type)
+        .expect("failed to call host function");
+    Ok(get_flatbuffer_result(()))
 }

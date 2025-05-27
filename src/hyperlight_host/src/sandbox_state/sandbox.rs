@@ -15,12 +15,11 @@ limitations under the License.
 */
 
 use std::fmt::Debug;
-use std::panic;
 
 use tracing::{instrument, Span};
 
 use super::transition::TransitionMetadata;
-use crate::Result;
+use crate::{new_error, Result};
 
 /// The minimal functionality of a Hyperlight sandbox. Most of the types
 /// and operations within this crate require `Sandbox` implementations.
@@ -48,27 +47,27 @@ pub trait Sandbox: Sized + Debug {
     // The default implementation is provided so that types that implement Sandbox (e.g. JSSandbox) but do not need to implement this trait do not need to provide an implementation
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
     fn check_stack_guard(&self) -> Result<bool> {
-        panic!("check_stack_guard not implemented for this type");
+        Err(new_error!(
+            "check_stack_guard not implemented for this type"
+        ))
     }
 }
 
 /// A utility trait to recognize a Sandbox that has not yet been initialized.
 /// It allows retrieval of a strongly typed UninitializedSandbox.
 pub trait UninitializedSandbox: Sandbox {
+    /// Retrieves reference to strongly typed `UninitializedSandbox`
     fn get_uninitialized_sandbox(&self) -> &crate::sandbox::UninitializedSandbox;
 
+    /// Retrieves mutable reference to strongly typed `UninitializedSandbox`
     fn get_uninitialized_sandbox_mut(&mut self) -> &mut crate::sandbox::UninitializedSandbox;
-
-    #[instrument(skip_all, parent = Span::current(), level= "Trace")]
-    fn is_running_in_process(&self) -> bool {
-        self.get_uninitialized_sandbox().run_inprocess
-    }
 }
 
 /// A `Sandbox` that knows how to "evolve" into a next state.
 pub trait EvolvableSandbox<Cur: Sandbox, Next: Sandbox, T: TransitionMetadata<Cur, Next>>:
     Sandbox
 {
+    /// Evolve `Self` to `Next` providing Metadata.
     fn evolve(self, tsn: T) -> Result<Next>;
 }
 
@@ -76,5 +75,6 @@ pub trait EvolvableSandbox<Cur: Sandbox, Next: Sandbox, T: TransitionMetadata<Cu
 pub trait DevolvableSandbox<Cur: Sandbox, Prev: Sandbox, T: TransitionMetadata<Cur, Prev>>:
     Sandbox
 {
+    /// Devolve `Self` to `Prev` providing Metadata.
     fn devolve(self, tsn: T) -> Result<Prev>;
 }

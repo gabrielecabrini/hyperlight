@@ -52,20 +52,22 @@ impl ElfInfo {
         self.entry
     }
     pub(crate) fn get_base_va(&self) -> u64 {
+        #[allow(clippy::unwrap_used)] // guaranteed not to panic because of the check in new()
         let min_phdr = self
             .phdrs
             .iter()
             .find(|phdr| phdr.p_type == PT_LOAD)
-            .unwrap(); // guaranteed not to panic because of the check in new()
+            .unwrap();
         min_phdr.p_vaddr
     }
     pub(crate) fn get_va_size(&self) -> usize {
+        #[allow(clippy::unwrap_used)] // guaranteed not to panic because of the check in new()
         let max_phdr = self
             .phdrs
             .iter()
             .rev()
             .find(|phdr| phdr.p_type == PT_LOAD)
-            .unwrap(); // guaranteed not to panic because of the check in new()
+            .unwrap();
         (max_phdr.p_vaddr + max_phdr.p_memsz - self.get_base_va()) as usize
     }
     pub(crate) fn load_at(&self, load_addr: usize, target: &mut [u8]) -> Result<()> {

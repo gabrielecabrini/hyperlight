@@ -19,35 +19,17 @@ use std::sync::{Arc, Mutex};
 use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
+use hyperlight_common::outb::{Exception, OutBAction};
 use log::{Level, Record};
 use tracing::{instrument, Span};
 use tracing_log::format_trace;
 
-use super::host_funcs::HostFuncsWrapper;
+use super::host_funcs::FunctionRegistry;
 use super::mem_mgr::MemMgrWrapper;
 use crate::hypervisor::handlers::{OutBHandler, OutBHandlerFunction, OutBHandlerWrapper};
 use crate::mem::mgr::SandboxMemoryManager;
 use crate::mem::shared_mem::HostSharedMemory;
 use crate::{new_error, HyperlightError, Result};
-
-pub(super) enum OutBAction {
-    Log,
-    CallFunction,
-    Abort,
-}
-
-impl TryFrom<u16> for OutBAction {
-    type Error = HyperlightError;
-    #[instrument(skip_all, parent = Span::current(), level= "Trace")]
-    fn try_from(val: u16) -> Result<Self> {
-        match val {
-            99 => Ok(OutBAction::Log),
-            101 => Ok(OutBAction::CallFunction),
-            102 => Ok(OutBAction::Abort),
-            _ => Err(new_error!("Invalid OutB value: {}", val)),
-        }
-    }
-}
 
 #[instrument(err(Debug), skip_all, parent = Span::current(), level="Trace")]
 pub(super) fn outb_log(mgr: &mut SandboxMemoryManager<HostSharedMemory>) -> Result<()> {
@@ -88,7 +70,7 @@ pub(super) fn outb_log(mgr: &mut SandboxMemoryManager<HostSharedMemory>) -> Resu
             &Record::builder()
                 .args(format_args!("{}", log_data.message))
                 .level(record_level)
-                .target("hyperlight-guest")
+                .target("hyperlight_guest")
                 .file(source_file)
                 .line(line)
                 .module_path(source)
@@ -100,7 +82,7 @@ pub(super) fn outb_log(mgr: &mut SandboxMemoryManager<HostSharedMemory>) -> Resu
             &Record::builder()
                 .args(format_args!("{}", log_data.message))
                 .level(record_level)
-                .target("hyperlight-guest")
+                .target("hyperlight_guest")
                 .file(Some(&log_data.source_file))
                 .line(Some(log_data.line))
                 .module_path(Some(&log_data.source))
@@ -111,13 +93,64 @@ pub(super) fn outb_log(mgr: &mut SandboxMemoryManager<HostSharedMemory>) -> Resu
     Ok(())
 }
 
+const ABORT_TERMINATOR: u8 = 0xFF;
+const MAX_ABORT_BUFFER_LEN: usize = 1024;
+
+fn outb_abort(mem_mgr: &mut MemMgrWrapper<HostSharedMemory>, data: u32) -> Result<()> {
+    let buffer = mem_mgr.get_abort_buffer_mut();
+
+    let bytes = data.to_le_bytes(); // [len, b1, b2, b3]
+    let len = bytes[0].min(3);
+
+    for &b in &bytes[1..=len as usize] {
+        if b == ABORT_TERMINATOR {
+            let guest_error_code = *buffer.first().unwrap_or(&0);
+            let guest_error = ErrorCode::from(guest_error_code as u64);
+
+            let result = match guest_error {
+                ErrorCode::StackOverflow => Err(HyperlightError::StackOverflow()),
+                _ => {
+                    let message = if let Some(&maybe_exception_code) = buffer.get(1) {
+                        match Exception::try_from(maybe_exception_code) {
+                            Ok(exception) => {
+                                let extra_msg = String::from_utf8_lossy(&buffer[2..]);
+                                format!("Exception: {:?} | {}", exception, extra_msg)
+                            }
+                            Err(_) => String::from_utf8_lossy(&buffer[1..]).into(),
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    Err(HyperlightError::GuestAborted(guest_error_code, message))
+                }
+            };
+
+            buffer.clear();
+            return result;
+        }
+
+        if buffer.len() >= MAX_ABORT_BUFFER_LEN {
+            buffer.clear();
+            return Err(HyperlightError::GuestAborted(
+                0,
+                "Guest abort buffer overflowed".into(),
+            ));
+        }
+
+        buffer.push(b);
+    }
+
+    Ok(())
+}
+
 /// Handles OutB operations from the guest.
 #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
 fn handle_outb_impl(
     mem_mgr: &mut MemMgrWrapper<HostSharedMemory>,
-    host_funcs: Arc<Mutex<HostFuncsWrapper>>,
+    host_funcs: Arc<Mutex<FunctionRegistry>>,
     port: u16,
-    byte: u64,
+    data: u32,
 ) -> Result<()> {
     match port.try_into()? {
         OutBAction::Log => outb_log(mem_mgr.as_mut()),
@@ -135,23 +168,17 @@ fn handle_outb_impl(
 
             Ok(())
         }
-        OutBAction::Abort => {
-            let guest_error = ErrorCode::from(byte);
-            let panic_context = mem_mgr.as_mut().read_guest_panic_context_data().unwrap();
-            // trim off trailing \0 bytes if they exist
-            let index_opt = panic_context.iter().position(|&x| x == 0x00);
-            let trimmed = match index_opt {
-                Some(n) => &panic_context[0..n],
-                None => &panic_context,
+        OutBAction::Abort => outb_abort(mem_mgr, data),
+        OutBAction::DebugPrint => {
+            let ch: char = match char::from_u32(data) {
+                Some(c) => c,
+                None => {
+                    return Err(new_error!("Invalid character for logging: {}", data));
+                }
             };
-            let s = String::from_utf8_lossy(trimmed);
-            match guest_error {
-                ErrorCode::StackOverflow => Err(HyperlightError::StackOverflow()),
-                _ => Err(HyperlightError::GuestAborted(
-                    byte as u8,
-                    s.trim().to_string(),
-                )),
-            }
+
+            eprint!("{}", ch);
+            Ok(())
         }
     }
 }
@@ -163,7 +190,7 @@ fn handle_outb_impl(
 #[instrument(skip_all, parent = Span::current(), level= "Trace")]
 pub(crate) fn outb_handler_wrapper(
     mut mem_mgr_wrapper: MemMgrWrapper<HostSharedMemory>,
-    host_funcs_wrapper: Arc<Mutex<HostFuncsWrapper>>,
+    host_funcs_wrapper: Arc<Mutex<FunctionRegistry>>,
 ) -> OutBHandlerWrapper {
     let outb_func: OutBHandlerFunction = Box::new(move |port, payload| {
         handle_outb_impl(
@@ -214,22 +241,14 @@ mod tests {
 
         let new_mgr = || {
             let mut exe_info = simple_guest_exe_info().unwrap();
-            let mut mgr = SandboxMemoryManager::load_guest_binary_into_memory(
-                sandbox_cfg,
-                &mut exe_info,
-                false,
-            )
-            .unwrap();
+            let mut mgr =
+                SandboxMemoryManager::load_guest_binary_into_memory(sandbox_cfg, &mut exe_info)
+                    .unwrap();
             let mem_size = mgr.get_shared_mem_mut().mem_size();
             let layout = mgr.layout;
             let shared_mem = mgr.get_shared_mem_mut();
             layout
-                .write(
-                    shared_mem,
-                    SandboxMemoryLayout::BASE_ADDRESS,
-                    mem_size,
-                    false,
-                )
+                .write(shared_mem, SandboxMemoryLayout::BASE_ADDRESS, mem_size)
                 .unwrap();
             let (hmgr, _) = mgr.build();
             hmgr
@@ -334,22 +353,14 @@ mod tests {
         tracing::subscriber::with_default(subscriber.clone(), || {
             let new_mgr = || {
                 let mut exe_info = simple_guest_exe_info().unwrap();
-                let mut mgr = SandboxMemoryManager::load_guest_binary_into_memory(
-                    sandbox_cfg,
-                    &mut exe_info,
-                    false,
-                )
-                .unwrap();
+                let mut mgr =
+                    SandboxMemoryManager::load_guest_binary_into_memory(sandbox_cfg, &mut exe_info)
+                        .unwrap();
                 let mem_size = mgr.get_shared_mem_mut().mem_size();
                 let layout = mgr.layout;
                 let shared_mem = mgr.get_shared_mem_mut();
                 layout
-                    .write(
-                        shared_mem,
-                        SandboxMemoryLayout::BASE_ADDRESS,
-                        mem_size,
-                        false,
-                    )
+                    .write(shared_mem, SandboxMemoryLayout::BASE_ADDRESS, mem_size)
                     .unwrap();
                 let (hmgr, _) = mgr.build();
                 hmgr
@@ -442,7 +453,7 @@ mod tests {
                         test_value_as_str(metadata_values_map, "level", expected_level);
                         test_value_as_str(event_values_map, "log.file", "test source file");
                         test_value_as_str(event_values_map, "log.module_path", "test source");
-                        test_value_as_str(event_values_map, "log.target", "hyperlight-guest");
+                        test_value_as_str(event_values_map, "log.target", "hyperlight_guest");
                         count_matching_events += 1;
                     }
                     assert!(

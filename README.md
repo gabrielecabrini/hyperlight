@@ -1,7 +1,7 @@
 <div align="center">
     <h1>Hyperlight</h1>
     <img src="https://raw.githubusercontent.com/hyperlight-dev/hyperlight/refs/heads/main/docs/assets/hyperlight-logo.png" width="150px" alt="hyperlight logo"/>
-    <p><strong>Hyperlight is a lightweight Virtual Machine Manager (VMM) designed to be embedded within applications. It enables safe execution of untrusted code within <i>micro virtual machines</i> with very low latency and minimal overhead.</strong></p>    
+    <p><strong>Hyperlight is a lightweight Virtual Machine Manager (VMM) designed to be embedded within applications. It enables safe execution of untrusted code within <i>micro virtual machines</i> with very low latency and minimal overhead.</strong> <br> We are a <a href="https://cncf.io/">Cloud Native Computing Foundation</a> sandbox project. </p>    
 </div>
 
 > Note: Hyperlight is a nascent project with an evolving API and no guaranteed support. Assistance is provided on a
@@ -27,8 +27,8 @@ By default, Hyperlight restricts guest access to a minimal API. The only _host f
 guest to print messages, which are displayed on the host console or redirected to stdout, as configured. Hosts can
 choose to expose additional host functions, expanding the guest’s capabilities as needed.
 
-Below is an example demonstrating the use of the Hyperlight host library in Rust to execute a simple guest application
-and an example of a simple guest application using the Hyperlight guest library in also written in Rust.
+Below is an example demonstrating the use of the Hyperlight host library in Rust to execute a simple guest application.
+It is followed by an example of a simple guest application using the Hyperlight guest library, also written in Rust.
 
 ### Host
 
@@ -42,21 +42,14 @@ fn main() -> hyperlight_host::Result<()> {
     // Create an uninitialized sandbox with a guest binary
     let mut uninitialized_sandbox = UninitializedSandbox::new(
         hyperlight_host::GuestBinary::FilePath(hyperlight_testing::simple_guest_as_string().unwrap()),
-        None, // default configuration
-        None, // default run options
-        None, // default host print function
+        None // default configuration
     )?;
 
-    // Register a host function
-    fn sleep_5_secs() -> hyperlight_host::Result<()> {
+    // Registering a host function makes it available to be called by the guest
+    uninitialized_sandbox.register("Sleep5Secs", || {
         thread::sleep(std::time::Duration::from_secs(5));
         Ok(())
-    }
-
-    let host_function = Arc::new(Mutex::new(sleep_5_secs));
-
-    // Registering a host function makes it available to be called by the guest
-    host_function.register(&mut uninitialized_sandbox, "Sleep5Secs")?;
+    })?;
     // Note: This function is unused by the guest code below, it's just here for demonstration purposes
 
     // Initialize sandbox to be able to call host functions
@@ -184,13 +177,10 @@ After having an environment with a hypervisor setup, running the example has the
    Azure Linux, run `sudo dnf install build-essential`.
 2. [Rust](https://www.rust-lang.org/tools/install). Install toolchain v1.81 or later.
 
-   Also, install the `x86_64-pc-windows-msvc` and `x86_64-unknown-none` targets, these are needed to build the test
-   guest binaries. (Note: install both targets on either Linux or Windows: Hyperlight can load ELF or PE files on either
-   OS, and the tests/examples are built for both):
-
+   Also, install the `x86_64-unknown-none` target, it is needed to build the test
+   guest binaries.
     ```sh
     rustup target add x86_64-unknown-none
-    rustup target add x86_64-pc-windows-msvc
     ```
 
 3. [just](https://github.com/casey/just). `cargo install just` On Windows you also need [pwsh](https://learn.microsoft.com/en-us/powershell/scripting/install/installing-powershell-on-windows?view=powershell-7.4).
@@ -260,6 +250,7 @@ Hyperlight.
 
 > Note: For general Hyperlight development, you may also need flatc (Flatbuffer compiler): for instructions,
 > see [here](https://github.com/google/flatbuffers).
+> Copyright © contributors to Hyperlight, established as Hyperlight a Series of LF Projects, LLC.
 
 ## Join our Community Meetings
 
@@ -268,13 +259,17 @@ This project holds fortnightly community meetings to discuss the project's progr
 - **When**: Every other Wednesday 09:00 (PST/PDT) [Convert to your local time](https://dateful.com/convert/pst-pdt-pacific-time?t=09)
 - **Where**: Zoom! - Agenda and information on how to join can be found in the [Hyperlight Community Meeting Notes](https://hackmd.io/blCrncfOSEuqSbRVT9KYkg#Agenda). Please log into hackmd to edit!
 
+## Chat with us on the CNCF Slack
+
+The Hyperlight project Slack is hosted in the CNCF Slack #hyperlight. To join the Slack, [join the CNCF Slack](https://www.cncf.io/membership-faq/#how-do-i-join-cncfs-slack), and join the #hyperlight channel.
+
 ## More Information
 
 For more information, please refer to our compilation of documents in the [`docs/` directory](./docs/README.md).
 
 ## Code of Conduct
 
-See the [Code of Conduct](./CODE_OF_CONDUCT.md).
+See the [CNCF Code of Conduct](https://github.com/cncf/foundation/blob/main/code-of-conduct.md).
 
 [wsl2]: https://docs.microsoft.com/en-us/windows/wsl/install
 

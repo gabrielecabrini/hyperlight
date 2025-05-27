@@ -20,6 +20,7 @@ use std::fmt::{Debug, Formatter};
 use std::string::String;
 
 use hyperlight_common::mem::PAGE_SIZE_USIZE;
+use log::LevelFilter;
 use tracing::{instrument, Span};
 use windows::Win32::System::Hypervisor::{
     WHvX64RegisterCr0, WHvX64RegisterCr3, WHvX64RegisterCr4, WHvX64RegisterCs, WHvX64RegisterEfer,
@@ -28,6 +29,8 @@ use windows::Win32::System::Hypervisor::{
 };
 
 use super::fpu::{FP_TAG_WORD_DEFAULT, MXCSR_DEFAULT};
+#[cfg(gdb)]
+use super::handlers::DbgMemAccessHandlerWrapper;
 use super::handlers::{MemAccessHandlerWrapper, OutBHandlerWrapper};
 use super::surrogate_process::SurrogateProcess;
 use super::surrogate_process_manager::*;
@@ -305,16 +308,23 @@ impl Hypervisor for HypervWindowsDriver {
         outb_hdl: OutBHandlerWrapper,
         mem_access_hdl: MemAccessHandlerWrapper,
         hv_handler: Option<HypervisorHandler>,
+        max_guest_log_level: Option<LevelFilter>,
+        #[cfg(gdb)] dbg_mem_access_hdl: DbgMemAccessHandlerWrapper,
     ) -> Result<()> {
+        let max_guest_log_level: u64 = match max_guest_log_level {
+            Some(level) => level as u64,
+            None => self.get_max_log_level().into(),
+        };
+
         let regs = WHvGeneralRegisters {
             rip: self.entrypoint,
             rsp: self.orig_rsp.absolute()?,
 
             // function args
-            rcx: peb_address.into(),
-            rdx: seed,
-            r8: page_size.into(),
-            r9: self.get_max_log_level().into(),
+            rdi: peb_address.into(),
+            rsi: seed,
+            rdx: page_size.into(),
+            rcx: max_guest_log_level,
             rflags: 1 << 1, // eflags bit index 1 is reserved and always needs to be 1
 
             ..Default::default()
@@ -326,14 +336,10 @@ impl Hypervisor for HypervWindowsDriver {
             hv_handler,
             outb_hdl,
             mem_access_hdl,
+            #[cfg(gdb)]
+            dbg_mem_access_hdl,
         )?;
 
-        // reset RSP to what it was before initialise
-        self.processor
-            .set_general_purpose_registers(&WHvGeneralRegisters {
-                rsp: self.orig_rsp.absolute()?,
-                ..Default::default()
-            })?;
         Ok(())
     }
 
@@ -344,12 +350,12 @@ impl Hypervisor for HypervWindowsDriver {
         outb_hdl: OutBHandlerWrapper,
         mem_access_hdl: MemAccessHandlerWrapper,
         hv_handler: Option<HypervisorHandler>,
+        #[cfg(gdb)] dbg_mem_access_hdl: DbgMemAccessHandlerWrapper,
     ) -> Result<()> {
-        // Reset general purpose registers except RSP, then set RIP
-        let rsp_before = self.processor.get_regs()?.rsp;
+        // Reset general purpose registers, then set RIP and RSP
         let regs = WHvGeneralRegisters {
             rip: dispatch_func_addr.into(),
-            rsp: rsp_before,
+            rsp: self.orig_rsp.absolute()?,
             rflags: 1 << 1, // eflags bit index 1 is reserved and always needs to be 1
             ..Default::default()
         };
@@ -368,14 +374,10 @@ impl Hypervisor for HypervWindowsDriver {
             hv_handler,
             outb_hdl,
             mem_access_hdl,
+            #[cfg(gdb)]
+            dbg_mem_access_hdl,
         )?;
 
-        // reset RSP to what it was before function call
-        self.processor
-            .set_general_purpose_registers(&WHvGeneralRegisters {
-                rsp: rsp_before,
-                ..Default::default()
-            })?;
         Ok(())
     }
 
@@ -388,11 +390,15 @@ impl Hypervisor for HypervWindowsDriver {
         instruction_length: u64,
         outb_handle_fn: OutBHandlerWrapper,
     ) -> Result<()> {
-        let payload = data[..8].try_into()?;
+        let mut padded = [0u8; 4];
+        let copy_len = data.len().min(4);
+        padded[..copy_len].copy_from_slice(&data[..copy_len]);
+        let val = u32::from_le_bytes(padded);
+
         outb_handle_fn
             .try_lock()
             .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?
-            .call(port, u64::from_le_bytes(payload))?;
+            .call(port, val)?;
 
         let mut regs = self.processor.get_regs()?;
         regs.rip = rip + instruction_length;
@@ -504,7 +510,7 @@ pub mod tests {
     #[serial]
     fn test_init() {
         let outb_handler = {
-            let func: Box<dyn FnMut(u16, u64) -> Result<()> + Send> =
+            let func: Box<dyn FnMut(u16, u32) -> Result<()> + Send> =
                 Box::new(|_, _| -> Result<()> { Ok(()) });
             Arc::new(Mutex::new(OutBHandler::from(func)))
         };

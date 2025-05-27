@@ -28,15 +28,17 @@ use crossbeam::atomic::AtomicCell;
 use crossbeam_channel::{Receiver, Sender};
 #[cfg(target_os = "linux")]
 use libc::{pthread_kill, pthread_self, ESRCH};
-use log::{error, info};
+use log::{error, info, LevelFilter};
 use tracing::{instrument, Span};
 #[cfg(target_os = "linux")]
 use vmm_sys_util::signal::SIGRTMIN;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Hypervisor::{WHvCancelRunVirtualProcessor, WHV_PARTITION_HANDLE};
 
-#[cfg(feature = "function_call_metrics")]
-use crate::histogram_vec_observe;
+#[cfg(gdb)]
+use super::gdb::create_gdb_thread;
+#[cfg(gdb)]
+use crate::hypervisor::handlers::DbgMemAccessHandlerWrapper;
 use crate::hypervisor::handlers::{MemAccessHandlerWrapper, OutBHandlerWrapper};
 #[cfg(target_os = "windows")]
 use crate::hypervisor::wrappers::HandleWrapper;
@@ -46,9 +48,9 @@ use crate::mem::mgr::SandboxMemoryManager;
 use crate::mem::ptr::{GuestPtr, RawPtr};
 use crate::mem::ptr_offset::Offset;
 use crate::mem::shared_mem::{GuestSharedMemory, HostSharedMemory, SharedMemory};
+#[cfg(gdb)]
+use crate::sandbox::config::DebugInfo;
 use crate::sandbox::hypervisor::{get_available_hypervisor, HypervisorType};
-#[cfg(feature = "function_call_metrics")]
-use crate::sandbox::metrics::SandboxMetric::GuestFunctionCallDurationMicroseconds;
 #[cfg(target_os = "linux")]
 use crate::signal_handlers::setup_signal_handlers;
 use crate::HyperlightError::{
@@ -185,6 +187,9 @@ pub(crate) struct HvHandlerConfig {
     pub(crate) outb_handler: OutBHandlerWrapper,
     pub(crate) mem_access_handler: MemAccessHandlerWrapper,
     pub(crate) max_wait_for_cancellation: Duration,
+    pub(crate) max_guest_log_level: Option<LevelFilter>,
+    #[cfg(gdb)]
+    pub(crate) dbg_mem_access_handler: DbgMemAccessHandlerWrapper,
 }
 
 impl HypervisorHandler {
@@ -232,12 +237,15 @@ impl HypervisorHandler {
     pub(crate) fn start_hypervisor_handler(
         &mut self,
         sandbox_memory_manager: SandboxMemoryManager<GuestSharedMemory>,
+        #[cfg(gdb)] debug_info: Option<DebugInfo>,
     ) -> Result<()> {
         let configuration = self.configuration.clone();
-        #[cfg(target_os = "windows")]
-        let in_process = sandbox_memory_manager.is_in_process();
 
-        *self.execution_variables.shm.try_lock().unwrap() = Some(sandbox_memory_manager);
+        *self
+            .execution_variables
+            .shm
+            .try_lock()
+            .map_err(|e| new_error!("Failed to lock shm: {}", e))? = Some(sandbox_memory_manager);
 
         // Other than running initialization and code execution, the handler thread also handles
         // cancellation. When we need to cancel the execution there are 2 possible cases
@@ -290,25 +298,21 @@ impl HypervisorHandler {
                             HypervisorHandlerAction::Initialise => {
                                 {
                                     hv = Some(set_up_hypervisor_partition(
-                                        execution_variables.shm.try_lock().unwrap().deref_mut().as_mut().unwrap(),
-                                        configuration.outb_handler.clone(),
+                                        execution_variables.shm.try_lock().map_err(|e| new_error!("Failed to lock shm: {}", e))?.deref_mut().as_mut().ok_or_else(|| new_error!("shm not set"))?,
+                                        #[cfg(gdb)]
+                                        &debug_info,
                                     )?);
                                 }
-                                let hv = hv.as_mut().unwrap();
+                                let hv = hv.as_mut().ok_or_else(|| new_error!("Hypervisor not set"))?;
 
                                 #[cfg(target_os = "windows")]
-                                if !in_process {
-                                    execution_variables
-                                        .set_partition_handle(hv.get_partition_handle())?;
-                                }
-
+                                execution_variables.set_partition_handle(hv.get_partition_handle())?;
                                 #[cfg(target_os = "linux")]
                                 {
                                     // We cannot use the Killable trait, so we get the `pthread_t` via a libc
                                     // call.
                                     execution_variables.set_thread_id(unsafe { pthread_self() })?;
                                 }
-                                execution_variables.running.store(true, Ordering::SeqCst);
 
                                 #[cfg(target_os = "linux")]
                                 execution_variables.run_cancelled.store(false);
@@ -346,6 +350,9 @@ impl HypervisorHandler {
                                     configuration.outb_handler.clone(),
                                     configuration.mem_access_handler.clone(),
                                     Some(hv_handler_clone.clone()),
+                                    configuration.max_guest_log_level,
+                                    #[cfg(gdb)]
+                                    configuration.dbg_mem_access_handler.clone(),
                                 );
                                 drop(mem_lock_guard);
                                 drop(evar_lock_guard);
@@ -373,10 +380,7 @@ impl HypervisorHandler {
                                 }
                             }
                             HypervisorHandlerAction::DispatchCallFromHost(function_name) => {
-                                let hv = hv.as_mut().unwrap();
-
-                                // Lock to indicate an action is being performed in the hypervisor
-                                execution_variables.running.store(true, Ordering::SeqCst);
+                                let hv = hv.as_mut().ok_or_else(|| new_error!("Hypervisor not initialized"))?;
 
                                 #[cfg(target_os = "linux")]
                                 execution_variables.run_cancelled.store(false);
@@ -420,34 +424,22 @@ impl HypervisorHandler {
                                     })?
                                     .shared_mem
                                     .lock
-                                    .try_read();
+                                        .try_read();
 
-                                let res = {
-                                    #[cfg(feature = "function_call_metrics")]
-                                    {
-                                        let start = std::time::Instant::now();
-                                        let result = hv.dispatch_call_from_host(
+                                let res = crate::metrics::maybe_time_and_emit_guest_call(
+                                    &function_name,
+                                    || {
+                                        hv.dispatch_call_from_host(
                                             dispatch_function_addr,
                                             configuration.outb_handler.clone(),
                                             configuration.mem_access_handler.clone(),
                                             Some(hv_handler_clone.clone()),
-                                        );
-                                        histogram_vec_observe!(
-                                            &GuestFunctionCallDurationMicroseconds,
-                                            &[function_name.as_str()],
-                                            start.elapsed().as_micros() as f64
-                                        );
-                                        result
-                                    }
+                                            #[cfg(gdb)]
+                                            configuration.dbg_mem_access_handler.clone(),
+                                        )
+                                    },
+                                );
 
-                                    #[cfg(not(feature = "function_call_metrics"))]
-                                    hv.dispatch_call_from_host(
-                                        dispatch_function_addr,
-                                        configuration.outb_handler.clone(),
-                                        configuration.mem_access_handler.clone(),
-                                        Some(hv_handler_clone.clone()),
-                                    )
-                                };
                                 drop(mem_lock_guard);
                                 drop(evar_lock_guard);
 
@@ -578,6 +570,7 @@ impl HypervisorHandler {
             // `TerminateHandlerThread`.
         }
 
+        self.set_running(true);
         self.communication_channels
             .to_handler_tx
             .send(hypervisor_handler_action)
@@ -597,11 +590,19 @@ impl HypervisorHandler {
     /// and still have to receive after sorting that out without sending
     /// an extra message.
     pub(crate) fn try_receive_handler_msg(&self) -> Result<()> {
-        match self
+        // When gdb debugging is enabled, we don't want to timeout on receiving messages
+        // from the handler thread, as the thread may be paused by gdb.
+        // In this case, we will wait indefinitely for a message from the handler thread.
+        // Note: This applies to all the running sandboxes, not just the one being debugged.
+        #[cfg(gdb)]
+        let response = self.communication_channels.from_handler_rx.recv();
+        #[cfg(not(gdb))]
+        let response = self
             .communication_channels
             .from_handler_rx
-            .recv_timeout(self.execution_variables.get_timeout()?)
-        {
+            .recv_timeout(self.execution_variables.get_timeout()?);
+
+        match response {
             Ok(msg) => match msg {
                 HandlerMsg::Error(e) => Err(e),
                 HandlerMsg::FinishedHypervisorHandlerAction => Ok(()),
@@ -622,6 +623,8 @@ impl HypervisorHandler {
                         // If the thread has finished, we try to join it and return the error if it has one
                         let res = handle.join();
                         if res.as_ref().is_ok_and(|inner_res| inner_res.is_err()) {
+                            #[allow(clippy::unwrap_used)]
+                            // We know that the thread has finished and that the inner result is an error, so we can safely unwrap the result and the contained err
                             return Err(res.unwrap().unwrap_err());
                         }
                         Err(HyperlightError::HypervisorHandlerMessageReceiveTimedout())
@@ -732,7 +735,7 @@ impl HypervisorHandler {
             if thread_id == u64::MAX {
                 log_then_return!("Failed to get thread id to signal thread");
             }
-            let mut count: i32 = 0;
+            let mut count: u128 = 0;
             // We need to send the signal multiple times in case the thread was between checking if it
             // should be cancelled and entering the run loop
 
@@ -746,7 +749,7 @@ impl HypervisorHandler {
             while !self.execution_variables.run_cancelled.load() {
                 count += 1;
 
-                if count > number_of_iterations.try_into().unwrap() {
+                if count > number_of_iterations {
                     break;
                 }
 
@@ -768,18 +771,15 @@ impl HypervisorHandler {
         }
         #[cfg(target_os = "windows")]
         {
-            if self.execution_variables.get_partition_handle()?.is_some() {
-                // partition handle only set when running in-hypervisor (not in-process)
-                unsafe {
-                    WHvCancelRunVirtualProcessor(
-                        self.execution_variables.get_partition_handle()?.unwrap(), // safe unwrap
-                        0,
-                        0,
-                    )
-                    .map_err(|e| new_error!("Failed to cancel guest execution {:?}", e))?;
-                }
+            unsafe {
+                WHvCancelRunVirtualProcessor(
+                    #[allow(clippy::unwrap_used)]
+                    self.execution_variables.get_partition_handle()?.unwrap(), // safe unwrap as we checked is some
+                    0,
+                    0,
+                )
+                .map_err(|e| new_error!("Failed to cancel guest execution {:?}", e))?;
             }
-            // if running in-process on windows, we currently have no way of cancelling the execution
         }
 
         Ok(())
@@ -821,8 +821,7 @@ pub enum HandlerMsg {
 
 fn set_up_hypervisor_partition(
     mgr: &mut SandboxMemoryManager<GuestSharedMemory>,
-    #[allow(unused_variables)] // parameter only used for in-process mode
-    outb_handler: OutBHandlerWrapper,
+    #[cfg(gdb)] debug_info: &Option<DebugInfo>,
 ) -> Result<Box<dyn Hypervisor>> {
     let mem_size = u64::try_from(mgr.shared_mem.mem_size())?;
     let mut regions = mgr.layout.get_memory_regions(&mgr.shared_mem)?;
@@ -855,76 +854,72 @@ fn set_up_hypervisor_partition(
             pml4_ptr
         );
     }
-    if mgr.is_in_process() {
-        cfg_if::cfg_if! {
-            if #[cfg(inprocess)] {
-                // in-process feature + debug build
-                use super::inprocess::InprocessArgs;
-                use crate::sandbox::leaked_outb::LeakedOutBWrapper;
-                use super::inprocess::InprocessDriver;
 
-                let leaked_outb_wrapper = LeakedOutBWrapper::new(mgr, outb_handler)?;
-                let hv = InprocessDriver::new(InprocessArgs {
-                    entrypoint_raw: u64::from(mgr.load_addr.clone() + mgr.entrypoint_offset),
-                    peb_ptr_raw: mgr
-                        .get_in_process_peb_address(mgr.shared_mem.base_addr() as u64)?,
-                    leaked_outb_wrapper,
-                })?;
-                Ok(Box::new(hv))
-            } else if #[cfg(inprocess)]{
-                // in-process feature, but not debug build
-                log_then_return!("In-process mode is only available on debug-builds");
-            } else if #[cfg(debug_assertions)] {
-                // debug build without in-process feature
-                log_then_return!("In-process mode requires `inprocess` cargo feature");
-            } else {
-                log_then_return!("In-process mode requires `inprocess` cargo feature and is only available on debug-builds");
+    // Create gdb thread if gdb is enabled and the configuration is provided
+    #[cfg(gdb)]
+    let gdb_conn = if let Some(DebugInfo { port }) = debug_info {
+        let gdb_conn = create_gdb_thread(*port, unsafe { pthread_self() });
+
+        // in case the gdb thread creation fails, we still want to continue
+        // without gdb
+        match gdb_conn {
+            Ok(gdb_conn) => Some(gdb_conn),
+            Err(e) => {
+                log::error!("Could not create gdb connection: {:#}", e);
+
+                None
             }
         }
     } else {
-        match *get_available_hypervisor() {
-            #[cfg(mshv)]
-            Some(HypervisorType::Mshv) => {
-                let hv = crate::hypervisor::hyperv_linux::HypervLinuxDriver::new(
-                    regions,
-                    entrypoint_ptr,
-                    rsp_ptr,
-                    pml4_ptr,
-                )?;
-                Ok(Box::new(hv))
-            }
+        None
+    };
 
-            #[cfg(kvm)]
-            Some(HypervisorType::Kvm) => {
-                let hv = crate::hypervisor::kvm::KVMDriver::new(
-                    regions,
-                    pml4_ptr.absolute()?,
-                    entrypoint_ptr.absolute()?,
-                    rsp_ptr.absolute()?,
-                )?;
-                Ok(Box::new(hv))
-            }
+    match *get_available_hypervisor() {
+        #[cfg(mshv)]
+        Some(HypervisorType::Mshv) => {
+            let hv = crate::hypervisor::hyperv_linux::HypervLinuxDriver::new(
+                regions,
+                entrypoint_ptr,
+                rsp_ptr,
+                pml4_ptr,
+                #[cfg(gdb)]
+                gdb_conn,
+            )?;
+            Ok(Box::new(hv))
+        }
 
-            #[cfg(target_os = "windows")]
-            Some(HypervisorType::Whp) => {
-                let mmap_file_handle = mgr
-                    .shared_mem
-                    .with_exclusivity(|e| e.get_mmap_file_handle())?;
-                let hv = crate::hypervisor::hyperv_windows::HypervWindowsDriver::new(
-                    regions,
-                    mgr.shared_mem.raw_mem_size(), // we use raw_* here because windows driver requires 64K aligned addresses,
-                    mgr.shared_mem.raw_ptr() as *mut c_void, // and instead convert it to base_addr where needed in the driver itself
-                    pml4_ptr.absolute()?,
-                    entrypoint_ptr.absolute()?,
-                    rsp_ptr.absolute()?,
-                    HandleWrapper::from(mmap_file_handle),
-                )?;
-                Ok(Box::new(hv))
-            }
+        #[cfg(kvm)]
+        Some(HypervisorType::Kvm) => {
+            let hv = crate::hypervisor::kvm::KVMDriver::new(
+                regions,
+                pml4_ptr.absolute()?,
+                entrypoint_ptr.absolute()?,
+                rsp_ptr.absolute()?,
+                #[cfg(gdb)]
+                gdb_conn,
+            )?;
+            Ok(Box::new(hv))
+        }
 
-            _ => {
-                log_then_return!(NoHypervisorFound());
-            }
+        #[cfg(target_os = "windows")]
+        Some(HypervisorType::Whp) => {
+            let mmap_file_handle = mgr
+                .shared_mem
+                .with_exclusivity(|e| e.get_mmap_file_handle())?;
+            let hv = crate::hypervisor::hyperv_windows::HypervWindowsDriver::new(
+                regions,
+                mgr.shared_mem.raw_mem_size(), // we use raw_* here because windows driver requires 64K aligned addresses,
+                mgr.shared_mem.raw_ptr() as *mut c_void, // and instead convert it to base_addr where needed in the driver itself
+                pml4_ptr.absolute()?,
+                entrypoint_ptr.absolute()?,
+                rsp_ptr.absolute()?,
+                HandleWrapper::from(mmap_file_handle),
+            )?;
+            Ok(Box::new(hv))
+        }
+
+        _ => {
+            log_then_return!(NoHypervisorFound());
         }
     }
 }
@@ -972,8 +967,6 @@ mod tests {
         let usbox = UninitializedSandbox::new(
             GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
             cfg,
-            None,
-            None,
         )
         .unwrap();
 

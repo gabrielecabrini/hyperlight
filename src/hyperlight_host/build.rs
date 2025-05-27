@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use anyhow::Result;
+#[cfg(feature = "build-metadata")]
 use built::write_built_file;
 
 fn main() -> Result<()> {
@@ -33,7 +34,7 @@ fn main() -> Result<()> {
         // Build hyperlight_surrogate and
         // Set $HYPERLIGHT_SURROGATE_DIR env var during rust build so we can
         // use it with RustEmbed to specify where hyperlight_surrogate.exe is
-        // to include as an embedded resource in the surrograte_process_manager
+        // to include as an embedded resource in the surrogate_process_manager
 
         // We need to copy/rename the source for hyperlight surrogate into a
         // temp directory because we cannot include a file name `Cargo.toml`
@@ -89,11 +90,9 @@ fn main() -> Result<()> {
     // Essentially the kvm and mshv features are ignored on windows as long as you use #[cfg(kvm)] and not #[cfg(feature = "kvm")].
     // You should never use #[cfg(feature = "kvm")] or #[cfg(feature = "mshv")] in the codebase.
     cfg_aliases::cfg_aliases! {
+        gdb: { all(feature = "gdb", debug_assertions, any(feature = "kvm", feature = "mshv2", feature = "mshv3"), target_os = "linux") },
         kvm: { all(feature = "kvm", target_os = "linux") },
         mshv: { all(any(feature = "mshv2", feature = "mshv3"), target_os = "linux") },
-        // inprocess feature is aliased with debug_assertions to make it only available in debug-builds.
-        // You should never use #[cfg(feature = "inprocess")] in the codebase. Use #[cfg(inprocess)] instead.
-        inprocess: { all(feature = "inprocess", debug_assertions) },
         // crashdump feature is aliased with debug_assertions to make it only available in debug-builds.
         crashdump: { all(feature = "crashdump", debug_assertions) },
         // print_debug feature is aliased with debug_assertions to make it only available in debug-builds.
@@ -105,6 +104,7 @@ fn main() -> Result<()> {
         mshv3: { all(feature = "mshv3", target_os = "linux") },
     }
 
+    #[cfg(feature = "build-metadata")]
     write_built_file()?;
 
     Ok(())

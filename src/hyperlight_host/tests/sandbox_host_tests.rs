@@ -13,12 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+#![allow(clippy::disallowed_macros)]
 use core::f64;
 use std::sync::{Arc, Mutex};
 
 use common::new_uninit;
-use hyperlight_host::func::{HostFunction1, ParameterValue, ReturnType, ReturnValue};
+use hyperlight_host::func::{ParameterValue, ReturnType, ReturnValue};
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::sandbox_state::sandbox::EvolvableSandbox;
 use hyperlight_host::sandbox_state::transition::Noop;
@@ -160,16 +160,14 @@ fn set_static() {
 fn multiple_parameters() {
     let messages = Arc::new(Mutex::new(Vec::new()));
     let messages_clone = messages.clone();
-    let writer = move |msg| {
+    let writer = move |msg: String| {
         let mut lock = messages_clone
             .try_lock()
             .map_err(|_| new_error!("Error locking"))
             .unwrap();
         lock.push(msg);
-        Ok(0)
+        0
     };
-
-    let writer_func = Arc::new(Mutex::new(writer));
 
     let test_cases = vec![
         (
@@ -320,7 +318,7 @@ fn multiple_parameters() {
         )
     ];
 
-    for mut sandbox in get_simpleguest_sandboxes(Some(&writer_func)).into_iter() {
+    for mut sandbox in get_simpleguest_sandboxes(Some(writer.into())).into_iter() {
         for (fn_name, args, _expected) in test_cases.clone().into_iter() {
             let res = sandbox.call_guest_function_by_name(fn_name, ReturnType::Int, Some(args));
             println!("{:?}", res);
@@ -392,8 +390,6 @@ fn max_memory_sandbox() {
     let a = UninitializedSandbox::new(
         GuestBinary::FilePath(simple_guest_as_string().unwrap()),
         Some(cfg),
-        None,
-        None,
     );
 
     assert!(matches!(
@@ -427,14 +423,13 @@ fn simple_test_helper() -> Result<()> {
             .map_err(|_| new_error!("Error locking"))
             .unwrap();
         lock.push(msg);
-        Ok(len as i32)
+        len as i32
     };
 
     let message = "hello";
     let message2 = "world";
 
-    let writer_func = Arc::new(Mutex::new(writer));
-    for mut sandbox in get_simpleguest_sandboxes(Some(&writer_func)).into_iter() {
+    for mut sandbox in get_simpleguest_sandboxes(Some(writer.into())).into_iter() {
         let res = sandbox.call_guest_function_by_name(
             "PrintOutput",
             ReturnType::Int,
@@ -461,18 +456,7 @@ fn simple_test_helper() -> Result<()> {
         assert!(matches!(res3, Ok(ReturnValue::VecBytes(v)) if v == buffer));
     }
 
-    let expected_calls = {
-        if cfg!(all(target_os = "windows", inprocess)) {
-            // windows debug build
-            5
-        } else if cfg!(inprocess) {
-            // linux debug build
-            4
-        } else {
-            // {windows,linux} release build
-            2
-        }
-    };
+    let expected_calls = 1;
 
     assert_eq!(
         messages
@@ -512,49 +496,20 @@ fn simple_test_parallel() {
     }
 }
 
-#[test]
-#[serial]
-#[cfg(all(target_os = "windows", inprocess))]
-fn only_one_sandbox_instance_with_loadlib() {
-    use hyperlight_host::SandboxRunOptions;
-    use hyperlight_testing::simple_guest_exe_as_string;
-
-    let _sandbox = UninitializedSandbox::new(
-        GuestBinary::FilePath(simple_guest_exe_as_string().unwrap()),
-        None,
-        Some(SandboxRunOptions::RunInProcess(true)),
-        None,
-    )
-    .unwrap();
-
-    let err = UninitializedSandbox::new(
-        GuestBinary::FilePath(simple_guest_exe_as_string().unwrap()),
-        None,
-        Some(SandboxRunOptions::RunInProcess(true)),
-        None,
-    )
-    .unwrap_err(); //should fail
-
-    assert!(
-        matches!(err, HyperlightError::Error(msg) if msg.starts_with("LoadedLib: Only one guest binary can be loaded at any single time"))
-    );
-}
-
 fn callback_test_helper() -> Result<()> {
     for mut sandbox in get_callbackguest_uninit_sandboxes(None).into_iter() {
         // create host function
         let vec = Arc::new(Mutex::new(vec![]));
         let vec_cloned = vec.clone();
-        let host_func1 = Arc::new(Mutex::new(move |msg: String| {
+
+        sandbox.register("HostMethod1", move |msg: String| {
             let len = msg.len();
             vec_cloned
                 .try_lock()
                 .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?
                 .push(msg);
             Ok(len as i32)
-        }));
-
-        host_func1.register(&mut sandbox, "HostMethod1").unwrap();
+        })?;
 
         // call guest function that calls host function
         let mut init_sandbox: MultiUseSandbox = sandbox.evolve(Noop::default())?;
@@ -606,15 +561,11 @@ fn callback_test_parallel() {
 #[test]
 #[cfg_attr(target_os = "windows", serial)] // using LoadLibrary requires serial tests
 fn host_function_error() -> Result<()> {
-    // TODO: Remove the `.take(1)`, which makes this test only run in hypervisor.
-    // This test does not work when running in process. This is because when running in-process,
-    // when a host function returns an error, an infinite loop is created.
-    for mut sandbox in get_callbackguest_uninit_sandboxes(None).into_iter().take(1) {
+    for mut sandbox in get_callbackguest_uninit_sandboxes(None).into_iter() {
         // create host function
-        let host_func1 = Arc::new(Mutex::new(|_msg: String| -> Result<String> {
+        sandbox.register("HostMethod1", |_: String| -> Result<String> {
             Err(new_error!("Host function error!"))
-        }));
-        host_func1.register(&mut sandbox, "HostMethod1").unwrap();
+        })?;
 
         // call guest function that calls host function
         let mut init_sandbox: MultiUseSandbox = sandbox.evolve(Noop::default())?;

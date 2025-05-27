@@ -23,12 +23,6 @@ pub(crate) mod hypervisor;
 /// Functionality for dealing with initialized sandboxes that can
 /// call 0 or more guest functions
 pub mod initialized_multi_use;
-/// A container to leak, store and manage outb handlers for in-process
-/// executions. On non-in-process executions (e.g. windows without
-/// in-process mode turned on, or linux), the same container is just
-/// a no-op
-#[cfg(inprocess)]
-pub(crate) mod leaked_outb;
 /// Functionality for dealing with memory access from the VM guest
 /// executable
 pub(crate) mod mem_access;
@@ -36,8 +30,6 @@ pub(crate) mod mem_access;
 /// `SandboxMemoryManager`
 pub(crate) mod mem_mgr;
 pub(crate) mod outb;
-/// Options for configuring a sandbox
-mod run_options;
 /// Functionality for creating uninitialized sandboxes, manipulating them,
 /// and converting them to initialized sandboxes.
 pub mod uninitialized;
@@ -45,17 +37,10 @@ pub mod uninitialized;
 /// initialized `Sandbox`es.
 pub(crate) mod uninitialized_evolve;
 
-/// Metric definitions for Sandbox module.
-pub(crate) mod metrics;
-
-use std::collections::HashMap;
-
 /// Re-export for `SandboxConfiguration` type
 pub use config::SandboxConfiguration;
 /// Re-export for the `MultiUseSandbox` type
 pub use initialized_multi_use::MultiUseSandbox;
-/// Re-export for `SandboxRunOptions` type
-pub use run_options::SandboxRunOptions;
 use tracing::{instrument, Span};
 /// Re-export for `GuestBinary` type
 pub use uninitialized::GuestBinary;
@@ -63,7 +48,6 @@ pub use uninitialized::GuestBinary;
 pub use uninitialized::UninitializedSandbox;
 
 use self::mem_mgr::MemMgrWrapper;
-use crate::func::HyperlightFunction;
 use crate::hypervisor::hypervisor_handler::HypervisorHandler;
 #[cfg(target_os = "windows")]
 use crate::hypervisor::windows_hypervisor_platform;
@@ -88,49 +72,6 @@ pub fn is_supported_platform() -> bool {
 
 /// Alias for the type of extra allowed syscalls.
 pub type ExtraAllowedSyscall = i64;
-
-/// A `HashMap` to map function names to `HyperlightFunction`s and their extra allowed syscalls.
-///
-/// Note: you cannot add extra syscalls on Windows, but the field is still present to avoid a funky
-/// conditional compilation setup. This isn't a big deal as this struct isn't public facing.
-#[derive(Clone, Default)]
-pub(super) struct FunctionsMap(
-    HashMap<String, (HyperlightFunction, Option<Vec<ExtraAllowedSyscall>>)>,
-);
-
-impl FunctionsMap {
-    /// Insert a new entry into the map
-    pub(super) fn insert(
-        &mut self,
-        key: String,
-        value: HyperlightFunction,
-        extra_syscalls: Option<Vec<ExtraAllowedSyscall>>,
-    ) {
-        self.0.insert(key, (value, extra_syscalls));
-    }
-
-    /// Get the value associated with the given key, if it exists.
-    pub(super) fn get(
-        &self,
-        key: &str,
-    ) -> Option<&(HyperlightFunction, Option<Vec<ExtraAllowedSyscall>>)> {
-        self.0.get(key)
-    }
-
-    /// Get the length of the map.
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-}
-
-impl PartialEq for FunctionsMap {
-    #[instrument(skip_all, parent = Span::current(), level= "Trace")]
-    fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.0.keys().all(|k| other.0.contains_key(k))
-    }
-}
-
-impl Eq for FunctionsMap {}
 
 /// Determine whether a suitable hypervisor is available to run
 /// this sandbox.
@@ -189,13 +130,9 @@ mod tests {
 
         for i in 0..10 {
             let simple_guest_path = simple_guest_as_string().expect("Guest Binary Missing");
-            let unintializedsandbox = UninitializedSandbox::new(
-                GuestBinary::FilePath(simple_guest_path),
-                None,
-                None,
-                None,
-            )
-            .unwrap_or_else(|_| panic!("Failed to create UninitializedSandbox {}", i));
+            let unintializedsandbox =
+                UninitializedSandbox::new(GuestBinary::FilePath(simple_guest_path), None)
+                    .unwrap_or_else(|_| panic!("Failed to create UninitializedSandbox {}", i));
 
             unintializedsandbox_queue
                 .push(unintializedsandbox)

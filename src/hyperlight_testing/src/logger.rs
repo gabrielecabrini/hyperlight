@@ -90,7 +90,7 @@ impl Log for Logger {
         }
 
         LOGCALLS.with(|log_calls| {
-            if record.target().contains("hyperlight-guest") {
+            if record.target().contains("hyperlight_guest") {
                 println!("Thread {:?} {:?}", current().id(), record);
                 println!("Thread {:?} {:?}", current().id(), record.metadata());
             }

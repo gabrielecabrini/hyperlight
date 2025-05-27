@@ -13,17 +13,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+#![allow(clippy::disallowed_macros)]
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::mem::PAGE_SIZE;
 use hyperlight_host::func::{ParameterValue, ReturnType, ReturnValue};
-#[cfg(not(feature = "executable_heap"))]
-use hyperlight_host::mem::memory_region::MemoryRegionFlags;
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::sandbox_state::sandbox::EvolvableSandbox;
 use hyperlight_host::sandbox_state::transition::Noop;
 use hyperlight_host::{GuestBinary, HyperlightError, MultiUseSandbox, UninitializedSandbox};
+use hyperlight_testing::simplelogger::{SimpleLogger, LOGGER};
 use hyperlight_testing::{c_simple_guest_as_string, simple_guest_as_string};
+use log::LevelFilter;
 
 pub mod common; // pub to disable dead_code warning
 use crate::common::{new_uninit, new_uninit_rust};
@@ -32,7 +32,7 @@ use crate::common::{new_uninit, new_uninit_rust};
 fn print_four_args_c_guest() {
     let path = c_simple_guest_as_string().unwrap();
     let guest_path = GuestBinary::FilePath(path);
-    let uninit = UninitializedSandbox::new(guest_path, None, None, None);
+    let uninit = UninitializedSandbox::new(guest_path, None);
     let mut sbox1 = uninit.unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1.call_guest_function_by_name(
@@ -63,7 +63,7 @@ fn guest_abort() {
         .unwrap_err();
     println!("{:?}", res);
     assert!(
-        matches!(res, HyperlightError::GuestAborted(code, message) if (code == error_code && message.is_empty()) )
+        matches!(res, HyperlightError::GuestAborted(code, message) if (code == error_code && message.is_empty()))
     );
 }
 
@@ -135,7 +135,7 @@ fn guest_abort_with_context2() {
         .unwrap_err();
     println!("{:?}", res);
     assert!(
-        matches!(res, HyperlightError::GuestAborted(_, context) if context.contains(&abort_message[..400]))
+        matches!(res, HyperlightError::GuestAborted(_, context) if context.contains("Guest abort buffer overflowed"))
     );
 }
 
@@ -146,7 +146,7 @@ fn guest_abort_with_context2() {
 fn guest_abort_c_guest() {
     let path = c_simple_guest_as_string().unwrap();
     let guest_path = GuestBinary::FilePath(path);
-    let uninit = UninitializedSandbox::new(guest_path, None, None, None);
+    let uninit = UninitializedSandbox::new(guest_path, None);
     let mut sbox1 = uninit.unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1
@@ -161,7 +161,7 @@ fn guest_abort_c_guest() {
         .unwrap_err();
     println!("{:?}", res);
     assert!(
-        matches!(res, HyperlightError::GuestAborted(code, message) if (code == 75 && message == "This is a test error message"))
+        matches!(res, HyperlightError::GuestAborted(code, message) if (code == 75 && message == "This is a test error message") )
     );
 }
 
@@ -247,8 +247,6 @@ fn guest_malloc_abort() {
     let uninit = UninitializedSandbox::new(
         GuestBinary::FilePath(simple_guest_as_string().unwrap()),
         Some(cfg),
-        None,
-        None,
     )
     .unwrap();
     let mut sbox2 = uninit.evolve(Noop::default()).unwrap();
@@ -271,7 +269,7 @@ fn guest_malloc_abort() {
 fn dynamic_stack_allocate_c_guest() {
     let path = c_simple_guest_as_string().unwrap();
     let guest_path = GuestBinary::FilePath(path);
-    let uninit = UninitializedSandbox::new(guest_path, None, None, None);
+    let uninit = UninitializedSandbox::new(guest_path, None);
     let mut sbox1: MultiUseSandbox = uninit.unwrap().evolve(Noop::default()).unwrap();
 
     let res2 = sbox1
@@ -388,20 +386,11 @@ fn execute_on_stack() {
         .call_guest_function_by_name("ExecuteOnStack", ReturnType::String, Some(vec![]))
         .unwrap_err();
 
-    // TODO: because we set the stack as NX in the guest PTE we get a generic error, once we handle the exception correctly in the guest we can make this more specific
-    if let HyperlightError::Error(message) = result {
-        cfg_if::cfg_if! {
-            if #[cfg(target_os = "linux")] {
-                assert!(message.starts_with("Unexpected VM Exit") || message.starts_with("unknown Hyper-V run message type"));
-            } else if #[cfg(target_os = "windows")] {
-                assert!(message.starts_with("Unexpected VM Exit \"Did not receive a halt from Hypervisor as expected - Received WHV_RUN_VP_EXIT_REASON(4)"));
-            } else {
-                panic!("Unexpected");
-            }
-        }
-    } else {
-        panic!("Unexpected error type");
-    }
+    let err = result.to_string();
+    assert!(
+        // exception that indicates a page fault
+        err.contains("PageFault")
+    );
 }
 
 #[test]
@@ -419,13 +408,8 @@ fn execute_on_heap() {
     {
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HyperlightError::MemoryAccessViolation(_, MemoryRegionFlags::EXECUTE, _)
-            ) || matches!(err, HyperlightError::Error(ref s) if s.starts_with("Unexpected VM Exit"))
-                || matches!(err, HyperlightError::Error(ref s) if s.starts_with("unknown Hyper-V run message type")) // Because the memory is set as NX in the guest PTE we get a generic error, once we handle the exception correctly in the guest we can make this more specific
-        );
+
+        assert!(err.to_string().contains("PageFault"));
     }
 }
 
@@ -471,69 +455,59 @@ fn recursive_stack_allocate_overflow() {
 #[test]
 #[ignore]
 fn log_message() {
-    use hyperlight_testing::simplelogger::{SimpleLogger, LOGGER};
-    // init
-    SimpleLogger::initialize_test_logger();
-
     // internal_dispatch_function does a log::trace! in debug mode, and we call it 6 times in `log_test_messages`
     let num_fixed_trace_log = if cfg!(debug_assertions) { 6 } else { 0 };
 
-    // test trace level
-    log::set_max_level(log::LevelFilter::Trace);
-    LOGGER.clear_log_calls();
-    assert_eq!(0, LOGGER.num_log_calls());
-    log_test_messages();
-    assert_eq!(5 + num_fixed_trace_log, LOGGER.num_log_calls());
-    // The number of enabled calls is the number of times that the enabled function is called
-    // with a target of "hyperlight-guest"
-    // This should be the same as the number of log calls as all the log calls for the "hyperlight-guest" target should be filtered in
-    // the guest
-    assert_eq!(LOGGER.num_log_calls(), LOGGER.num_enabled_calls());
+    let tests = vec![
+        (LevelFilter::Trace, 5 + num_fixed_trace_log),
+        (LevelFilter::Debug, 4),
+        (LevelFilter::Info, 3),
+        (LevelFilter::Warn, 2),
+        (LevelFilter::Error, 1),
+        (LevelFilter::Off, 0),
+    ];
 
-    // test debug level
-    log::set_max_level(log::LevelFilter::Debug);
-    LOGGER.clear_log_calls();
-    assert_eq!(0, LOGGER.num_log_calls());
-    log_test_messages();
-    assert_eq!(4, LOGGER.num_log_calls());
-    assert_eq!(LOGGER.num_log_calls(), LOGGER.num_enabled_calls());
+    // init
+    SimpleLogger::initialize_test_logger();
 
-    // test info level
-    log::set_max_level(log::LevelFilter::Info);
-    LOGGER.clear_log_calls();
-    assert_eq!(0, LOGGER.num_log_calls());
-    log_test_messages();
-    assert_eq!(3, LOGGER.num_log_calls());
-    assert_eq!(LOGGER.num_log_calls(), LOGGER.num_enabled_calls());
+    for test in tests {
+        let (level, expected) = test;
 
-    // test warn level
-    log::set_max_level(log::LevelFilter::Warn);
-    LOGGER.clear_log_calls();
-    assert_eq!(0, LOGGER.num_log_calls());
-    log_test_messages();
-    assert_eq!(2, LOGGER.num_log_calls());
-    assert_eq!(LOGGER.num_log_calls(), LOGGER.num_enabled_calls());
+        // Test setting max log level via method on uninit sandbox
+        log_test_messages(Some(level));
+        assert_eq!(expected, LOGGER.num_log_calls());
 
-    // test error level
-    log::set_max_level(log::LevelFilter::Error);
-    LOGGER.clear_log_calls();
-    assert_eq!(0, LOGGER.num_log_calls());
-    log_test_messages();
+        // Set the log level via env var
+        std::env::set_var("RUST_LOG", format!("hyperlight_guest={}", level));
+        log_test_messages(None);
+        assert_eq!(expected, LOGGER.num_log_calls());
+
+        std::env::set_var("RUST_LOG", format!("hyperlight_host={}", level));
+        log_test_messages(None);
+        assert_eq!(expected, LOGGER.num_log_calls());
+
+        std::env::set_var("RUST_LOG", format!("{}", level));
+        log_test_messages(None);
+        assert_eq!(expected, LOGGER.num_log_calls());
+
+        std::env::remove_var("RUST_LOG");
+    }
+
+    // Test that if no log level is set, the default is error
+    log_test_messages(None);
     assert_eq!(1, LOGGER.num_log_calls());
-    assert_eq!(LOGGER.num_log_calls(), LOGGER.num_enabled_calls());
-
-    // test off level
-    log::set_max_level(log::LevelFilter::Off);
-    LOGGER.clear_log_calls();
-    assert_eq!(0, LOGGER.num_log_calls());
-    log_test_messages();
-    assert_eq!(0, LOGGER.num_log_calls());
-    assert_eq!(LOGGER.num_log_calls(), LOGGER.num_enabled_calls());
 }
 
-fn log_test_messages() {
+fn log_test_messages(levelfilter: Option<log::LevelFilter>) {
+    LOGGER.clear_log_calls();
+    assert_eq!(0, LOGGER.num_log_calls());
     for level in log::LevelFilter::iter() {
-        let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
+        let mut sbox = new_uninit().unwrap();
+        if let Some(levelfilter) = levelfilter {
+            sbox.set_max_guest_log_level(levelfilter);
+        }
+
+        let mut sbox1 = sbox.evolve(Noop::default()).unwrap();
 
         let message = format!("Hello from log_message level {}", level as i32);
         sbox1

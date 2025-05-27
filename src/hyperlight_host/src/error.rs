@@ -25,7 +25,6 @@ use std::cell::{BorrowError, BorrowMutError};
 use std::convert::Infallible;
 use std::error::Error;
 use std::num::TryFromIntError;
-use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 use std::sync::{MutexGuard, PoisonError};
 use std::time::SystemTimeError;
@@ -35,20 +34,12 @@ use crossbeam_channel::{RecvError, SendError};
 use flatbuffers::InvalidFlatbuffer;
 use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnValue};
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
-use serde::{Deserialize, Serialize};
-use serde_yaml;
 use thiserror::Error;
 
 #[cfg(target_os = "windows")]
 use crate::hypervisor::wrappers::HandleWrapper;
 use crate::mem::memory_region::MemoryRegionFlags;
 use crate::mem::ptr::RawPtr;
-
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub(crate) struct HyperlightHostError {
-    pub(crate) message: String,
-    pub(crate) source: String,
-}
 
 /// The error type for Hyperlight operations
 #[derive(Error, Debug)]
@@ -87,14 +78,6 @@ pub enum HyperlightError {
     #[error("{0}")]
     Error(String),
 
-    /// Exception Data Length is incorrect
-    #[error("Exception Data Length is incorrect. Expected: {0}, Actual: {1}")]
-    ExceptionDataLengthIncorrect(i32, usize),
-
-    /// Exception Message is too big
-    #[error("Exception Message is too big. Max Size: {0}, Actual: {1}")]
-    ExceptionMessageTooBig(usize, usize),
-
     /// Execution violation
     #[error("Non-executable address {0:#x} tried to be executed")]
     ExecutionAccessViolation(u64),
@@ -114,10 +97,6 @@ pub enum HyperlightError {
     /// Guest aborted during outb
     #[error("Guest aborted: {0} {1}")]
     GuestAborted(u8, String),
-
-    ///Cannot run from guest binary unless the binary is a file
-    #[error("Cannot run from guest binary when guest binary is a buffer")]
-    GuestBinaryShouldBeAFile(),
 
     /// Guest call resulted in error in guest
     #[error("Guest error occurred {0:?}: {1}")]
@@ -171,14 +150,14 @@ pub enum HyperlightError {
     #[error("The flatbuffer is invalid")]
     InvalidFlatBuffer(#[from] InvalidFlatbuffer),
 
-    /// Conversion of str to Json failed
-    #[error("Conversion of str data to json failed")]
-    JsonConversionFailure(#[from] serde_json::Error),
-
     /// Error occurred in KVM Operation
     #[error("KVM Error {0:?}")]
     #[cfg(kvm)]
-    KVMError(#[source] kvm_ioctls::Error),
+    KVMError(#[from] kvm_ioctls::Error),
+
+    /// Conversion of str to Json failed
+    #[error("Conversion of str data to json failed")]
+    JsonConversionFailure(#[from] serde_json::Error),
 
     /// An attempt to get a lock from a Mutex failed.
     #[error("Unable to lock resource")]
@@ -225,10 +204,6 @@ pub enum HyperlightError {
     #[error("Restore_state called with no valid snapshot")]
     NoMemorySnapshot,
 
-    /// An error occurred handling an outb message
-    #[error("An error occurred handling an outb message {0:?}: {1}")]
-    OutBHandlingError(String, String),
-
     /// Failed to get value from parameter value
     #[error("Failed To Convert Parameter Value {0:?} to {1:?}")]
     ParameterValueConversionFailure(ParameterValue, &'static str),
@@ -236,10 +211,6 @@ pub enum HyperlightError {
     /// a failure occurred processing a PE file
     #[error("Failure processing PE File {0:?}")]
     PEFileProcessingFailure(#[from] goblin::error::Error),
-
-    /// a Prometheus error occurred
-    #[error("Prometheus Error {0:?}")]
-    Prometheus(#[from] prometheus::Error),
 
     /// Raw pointer is less than base address
     #[error("Raw pointer ({0:?}) was less than the base address ({1})")]
@@ -275,6 +246,11 @@ pub enum HyperlightError {
     #[error("SystemTimeError {0:?}")]
     SystemTimeError(#[from] SystemTimeError),
 
+    /// Error occurred when translating guest address
+    #[error("An error occurred when translating guest address: {0:?}")]
+    #[cfg(gdb)]
+    TranslateGuestAddress(u64),
+
     /// Error occurred converting a slice to an array
     #[error("TryFromSliceError {0:?}")]
     TryFromSliceError(#[from] TryFromSliceError),
@@ -290,10 +266,6 @@ pub enum HyperlightError {
     /// The return value type is unexpected
     #[error("The return value type is unexpected got {0:?} expected {1:?}")]
     UnexpectedReturnValueType(ReturnValue, String),
-
-    /// Slice conversion to UTF8 failed
-    #[error("Slice Conversion of UTF8 data to str failed")]
-    UTF8SliceConversionFailure(#[from] Utf8Error),
 
     /// Slice conversion to UTF8 failed
     #[error("String Conversion of UTF8 data to str failed")]
@@ -314,10 +286,6 @@ pub enum HyperlightError {
     #[cfg(target_os = "windows")]
     #[error("Windows API Error Result {0:?}")]
     WindowsAPIError(#[from] windows_result::Error),
-
-    /// Conversion of str to YAML failed
-    #[error("Conversion of str data to yaml failed")]
-    YamlConversionFailure(#[from] serde_yaml::Error),
 }
 
 impl From<Infallible> for HyperlightError {

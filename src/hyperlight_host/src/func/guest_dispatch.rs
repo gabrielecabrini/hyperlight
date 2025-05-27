@@ -112,7 +112,6 @@ mod tests {
 
     use super::*;
     use crate::func::call_ctx::MultiUseGuestCallContext;
-    use crate::func::host_functions::HostFunction0;
     use crate::sandbox::is_hypervisor_present;
     use crate::sandbox::uninitialized::GuestBinary;
     use crate::sandbox_state::sandbox::EvolvableSandbox;
@@ -152,17 +151,13 @@ mod tests {
 
         // First, run  to make sure it fails.
         {
-            let make_get_pid_syscall_func = Arc::new(Mutex::new(make_get_pid_syscall));
-
             let mut usbox = UninitializedSandbox::new(
                 GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
-                None,
-                None,
                 None,
             )
             .unwrap();
 
-            make_get_pid_syscall_func.register(&mut usbox, "MakeGetpidSyscall")?;
+            usbox.register("MakeGetpidSyscall", make_get_pid_syscall)?;
 
             let mut sbox: MultiUseSandbox = usbox.evolve(Noop::default())?;
 
@@ -188,19 +183,15 @@ mod tests {
         // Second, run with allowing `SYS_getpid`
         #[cfg(feature = "seccomp")]
         {
-            let make_get_pid_syscall_func = Arc::new(Mutex::new(make_get_pid_syscall));
-
             let mut usbox = UninitializedSandbox::new(
                 GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
-                None,
-                None,
                 None,
             )
             .unwrap();
 
-            make_get_pid_syscall_func.register_with_extra_allowed_syscalls(
-                &mut usbox,
+            usbox.register_with_extra_allowed_syscalls(
                 "MakeGetpidSyscall",
+                make_get_pid_syscall,
                 vec![libc::SYS_getpid],
             )?;
             // ^^^ note, we are allowing SYS_getpid
@@ -224,8 +215,6 @@ mod tests {
         let uninitialized_sandbox = || {
             UninitializedSandbox::new(
                 GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
-                None,
-                None,
                 None,
             )
             .unwrap()
@@ -341,9 +330,6 @@ mod tests {
             // variability below
             None,
             // by default, the below represents in-hypervisor mode
-            None,
-            // just use the built-in host print function
-            None,
         )
         .unwrap();
         test_call_guest_function_by_name(u_sbox);
@@ -352,34 +338,6 @@ mod tests {
     #[test]
     fn test_call_guest_function_by_name_hv() {
         call_guest_function_by_name_hv();
-    }
-
-    #[test]
-    #[cfg(all(target_os = "windows", inprocess))]
-    fn test_call_guest_function_by_name_in_proc_load_lib() {
-        use hyperlight_testing::simple_guest_exe_as_string;
-
-        let u_sbox = UninitializedSandbox::new(
-            GuestBinary::FilePath(simple_guest_exe_as_string().expect("Guest Exe Missing")),
-            None,
-            Some(crate::SandboxRunOptions::RunInProcess(true)),
-            None,
-        )
-        .unwrap();
-        test_call_guest_function_by_name(u_sbox);
-    }
-
-    #[test]
-    #[cfg(inprocess)]
-    fn test_call_guest_function_by_name_in_proc_manual() {
-        let u_sbox = UninitializedSandbox::new(
-            guest_bin(),
-            None,
-            Some(crate::SandboxRunOptions::RunInProcess(false)),
-            None,
-        )
-        .unwrap();
-        test_call_guest_function_by_name(u_sbox);
     }
 
     fn terminate_vcpu_after_1000ms() -> Result<()> {
@@ -391,8 +349,6 @@ mod tests {
         }
         let usbox = UninitializedSandbox::new(
             GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
-            None,
-            None,
             None,
         )?;
         let sandbox: MultiUseSandbox = usbox.evolve(Noop::default())?;
@@ -441,8 +397,6 @@ mod tests {
         let mut usbox = UninitializedSandbox::new(
             GuestBinary::FilePath(callback_guest_as_string().expect("Guest Binary Missing")),
             None,
-            None,
-            None,
         )
         .unwrap();
 
@@ -453,18 +407,12 @@ mod tests {
             Ok(())
         }
 
-        let host_spin_func = Arc::new(Mutex::new(spin));
-
         #[cfg(any(target_os = "windows", not(feature = "seccomp")))]
-        host_spin_func.register(&mut usbox, "Spin").unwrap();
+        usbox.register("Spin", spin).unwrap();
 
         #[cfg(all(target_os = "linux", feature = "seccomp"))]
-        host_spin_func
-            .register_with_extra_allowed_syscalls(
-                &mut usbox,
-                "Spin",
-                vec![libc::SYS_clock_nanosleep],
-            )
+        usbox
+            .register_with_extra_allowed_syscalls("Spin", spin, vec![libc::SYS_clock_nanosleep])
             .unwrap();
 
         let sandbox: MultiUseSandbox = usbox.evolve(Noop::default()).unwrap();
@@ -476,6 +424,36 @@ mod tests {
             HyperlightError::GuestExecutionHungOnHostFunctionCall() => {}
             e => panic!(
                 "Expected HyperlightError::GuestExecutionHungOnHostFunctionCall but got {:?}",
+                e
+            ),
+        }
+    }
+
+    #[test]
+    fn test_trigger_exception_on_guest() {
+        let usbox = UninitializedSandbox::new(
+            GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
+            None,
+        )
+        .unwrap();
+
+        let mut multi_use_sandbox: MultiUseSandbox = usbox.evolve(Noop::default()).unwrap();
+
+        let res = multi_use_sandbox.call_guest_function_by_name(
+            "TriggerException",
+            ReturnType::Void,
+            None,
+        );
+
+        assert!(res.is_err());
+
+        match res.unwrap_err() {
+            HyperlightError::GuestAborted(_, msg) => {
+                // msg should indicate we got an invalid opcode exception
+                assert!(msg.contains("InvalidOpcode"));
+            }
+            e => panic!(
+                "Expected HyperlightError::GuestExecutionError but got {:?}",
                 e
             ),
         }

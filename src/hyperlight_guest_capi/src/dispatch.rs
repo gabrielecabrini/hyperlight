@@ -10,7 +10,7 @@ use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_guest::error::{HyperlightGuestError, Result};
 use hyperlight_guest::guest_function_definition::GuestFunctionDefinition;
 use hyperlight_guest::guest_function_register::GuestFunctionRegister;
-use hyperlight_guest::host_function_call::call_host_function;
+use hyperlight_guest::host_function_call::call_host_function_internal;
 
 use crate::types::{FfiFunctionCall, FfiVec};
 static mut REGISTERED_C_GUEST_FUNCTIONS: GuestFunctionRegister = GuestFunctionRegister::new();
@@ -39,7 +39,7 @@ pub fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>> {
         let ffi_func_call = FfiFunctionCall::from_function_call(function_call)?;
 
         let guest_func =
-            unsafe { mem::transmute::<i64, CGuestFunc>(registered_func.function_pointer) };
+            unsafe { mem::transmute::<usize, CGuestFunc>(registered_func.function_pointer) };
         let function_result = guest_func(&ffi_func_call);
 
         unsafe { Ok(FfiVec::into_vec(*function_result)) }
@@ -76,12 +76,8 @@ pub extern "C" fn hl_register_function_definition(
 
     let func_params = unsafe { slice::from_raw_parts(params_type, param_no).to_vec() };
 
-    let func_def = GuestFunctionDefinition::new(
-        func_name,
-        func_params,
-        return_type,
-        func_ptr as usize as i64,
-    );
+    let func_def =
+        GuestFunctionDefinition::new(func_name, func_params, return_type, func_ptr as usize);
 
     #[allow(static_mut_refs)]
     unsafe { &mut REGISTERED_C_GUEST_FUNCTIONS }.register(func_def);
@@ -93,5 +89,9 @@ pub extern "C" fn hl_call_host_function(function_call: &FfiFunctionCall) {
     let parameters = unsafe { function_call.copy_parameters() };
     let func_name = unsafe { function_call.copy_function_name() };
     let return_type = unsafe { function_call.copy_return_type() };
-    let _ = call_host_function(&func_name, Some(parameters), return_type);
+
+    // Use the non-generic internal implementation
+    // The C API will then call specific getter functions to fetch the properly typed return value
+    let _ = call_host_function_internal(&func_name, Some(parameters), return_type)
+        .expect("Failed to call host function");
 }

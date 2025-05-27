@@ -23,7 +23,7 @@ use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 
 use crate::entrypoint::halt;
 use crate::error::{HyperlightGuestError, Result};
-use crate::guest_error::{reset_error, set_error};
+use crate::guest_error::set_error;
 use crate::shared_input_data::try_pop_shared_input_data_into;
 use crate::shared_output_data::push_shared_output_data;
 use crate::REGISTERED_GUEST_FUNCTIONS;
@@ -58,7 +58,7 @@ pub(crate) fn call_guest_function(function_call: FunctionCall) -> Result<Vec<u8>
 
         let p_function = unsafe {
             let function_pointer = registered_function_definition.function_pointer;
-            core::mem::transmute::<i64, GuestFunc>(function_pointer)
+            core::mem::transmute::<usize, GuestFunc>(function_pointer)
         };
 
         p_function(&function_call)
@@ -81,8 +81,6 @@ pub(crate) fn call_guest_function(function_call: FunctionCall) -> Result<Vec<u8>
 #[no_mangle]
 #[inline(never)]
 fn internal_dispatch_function() -> Result<()> {
-    reset_error();
-
     #[cfg(debug_assertions)]
     log::trace!("internal_dispatch_function");
 
@@ -99,7 +97,7 @@ fn internal_dispatch_function() -> Result<()> {
 // This is implemented as a separate function to make sure that epilogue in the internal_dispatch_function is called before the halt()
 // which if it were included in the internal_dispatch_function cause the epilogue to not be called because the halt() would not return
 // when running in the hypervisor.
-pub(crate) extern "win64" fn dispatch_function() {
+pub(crate) extern "C" fn dispatch_function() {
     let _ = internal_dispatch_function();
     halt();
 }

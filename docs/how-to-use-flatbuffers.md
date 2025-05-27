@@ -1,5 +1,7 @@
 # How to use FlatBuffers
 
+> Note: the last generation of the flatbuffer code was with done with flatc version 25.2.10 (i.e., the last version as of May 1st, 2025).
+
 Flatbuffers is used to serialize and deserialize some data structures.
 
 Schema files are used to define the data structures and are used to generate the code to serialize and deserialize the data structures.

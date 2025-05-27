@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use hyperlight_common::mem::PAGE_SIZE_USIZE;
 use rust_embed::RustEmbed;
-use tracing::{info, instrument, Span};
+use tracing::{error, info, instrument, Span};
 use windows::core::{s, PCSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
@@ -169,8 +169,11 @@ impl SurrogateProcessManager {
         };
 
         if allocated_address.Value.is_null() {
+            // Safety: `MapViewOfFileNuma2` will set the last error code if it fails.
+            let error = unsafe { windows::Win32::Foundation::GetLastError() };
             log_then_return!(
-                "MapViewOfFileNuma2 failed for mem address {:?}",
+                "MapViewOfFileNuma2 failed with error code: {:?} for mem address {:?} ",
+                error,
                 raw_source_address
             );
         }
@@ -251,27 +254,42 @@ impl Drop for SurrogateProcessManager {
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
     fn drop(&mut self) {
         let handle: HANDLE = self.job_handle.into();
-        unsafe {
+        if unsafe {
             // Terminating the job object will terminate all the surrogate
             // processes.
 
             TerminateJobObject(handle, 0)
         }
-        .expect("surrogate job objects were not all terminated error:");
+        .is_err()
+        {
+            error!("surrogate job objects were not all terminated");
+        }
     }
 }
 
 lazy_static::lazy_static! {
     // see the large comment inside `SurrogateProcessManager` describing
     // our reasoning behind using `lazy_static`.
-    static ref SURROGATE_PROCESSES_MANAGER: SurrogateProcessManager =
-        SurrogateProcessManager::new().unwrap();
+    static ref SURROGATE_PROCESSES_MANAGER: std::result::Result<SurrogateProcessManager, &'static str> =
+        match SurrogateProcessManager::new() {
+            Ok(manager) => Ok(manager),
+            Err(e) => {
+                error!("Failed to create SurrogateProcessManager: {:?}", e);
+                Err("Failed to create SurrogateProcessManager")
+            }
+        };
 }
 
 /// Gets the singleton SurrogateProcessManager. This should be called when a new HyperV on Windows Driver is created.
 #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
 pub(crate) fn get_surrogate_process_manager() -> Result<&'static SurrogateProcessManager> {
-    Ok(&SURROGATE_PROCESSES_MANAGER)
+    match &*SURROGATE_PROCESSES_MANAGER {
+        Ok(manager) => Ok(manager),
+        Err(e) => {
+            error!("Failed to get SurrogateProcessManager: {:?}", e);
+            Err(new_error!("Failed to get SurrogateProcessManager {}", e))
+        }
+    }
 }
 
 // Creates a job object that will terminate all the surrogate processes when the struct instance is dropped.
@@ -335,7 +353,7 @@ fn ensure_surrogate_process_exe() -> Result<()> {
 
         if embedded_file_sha != file_on_disk_sha {
             println!(
-                "sha of embedded surrorate '{}' does not match sha of file on disk '{}' - deleting surrogate binary at {}",
+                "sha of embedded surrogate '{}' does not match sha of file on disk '{}' - deleting surrogate binary at {}",
                 embedded_file_sha,
                 file_on_disk_sha,
                 &surrogate_process_path.display()
@@ -417,7 +435,7 @@ mod tests {
     use hyperlight_common::mem::PAGE_SIZE_USIZE;
     use rand::{rng, Rng};
     use serial_test::serial;
-    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
     };
@@ -426,6 +444,7 @@ mod tests {
         CreateFileMappingA, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
         SEC_COMMIT,
     };
+    use windows_result::BOOL;
 
     use super::*;
     use crate::mem::shared_mem::{ExclusiveSharedMemory, SharedMemory};

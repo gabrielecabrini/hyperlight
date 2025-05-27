@@ -41,7 +41,6 @@ fn copy_includes<P: AsRef<Path>, Q: AsRef<Path> + std::fmt::Debug>(include_dir: 
 
 fn cargo_main() {
     println!("cargo:rerun-if-changed=third_party");
-    println!("cargo:rerun-if-changed=include");
 
     let mut cfg = cc::Build::new();
 
@@ -121,7 +120,6 @@ fn cargo_main() {
         copy_includes(&include_dir, "third_party/printf/");
     }
     if cfg!(feature = "libc") {
-        copy_includes(&include_dir, "include");
         copy_includes(&include_dir, "third_party/musl/include");
         copy_includes(&include_dir, "third_party/musl/arch/generic");
         copy_includes(&include_dir, "third_party/musl/arch/x86_64");

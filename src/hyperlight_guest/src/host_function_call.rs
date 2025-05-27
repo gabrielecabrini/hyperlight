@@ -14,125 +14,47 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use core::arch::global_asm;
+use core::arch;
 
 use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
 use hyperlight_common::flatbuffer_wrappers::function_types::{
     ParameterValue, ReturnType, ReturnValue,
 };
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
-use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result_from_int;
-use hyperlight_common::mem::RunMode;
+use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result;
+use hyperlight_common::outb::OutBAction;
 
 use crate::error::{HyperlightGuestError, Result};
-use crate::host_error::check_for_host_error;
-use crate::host_functions::validate_host_function_call;
 use crate::shared_input_data::try_pop_shared_input_data_into;
 use crate::shared_output_data::push_shared_output_data;
-use crate::{OUTB_PTR, OUTB_PTR_WITH_CONTEXT, P_PEB, RUNNING_MODE};
 
-pub enum OutBAction {
-    Log = 99,
-    CallFunction = 101,
-    Abort = 102,
-}
-
-pub fn get_host_value_return_as_void() -> Result<()> {
+/// Get a return value from a host function call.
+/// This usually requires a host function to be called first using `call_host_function_internal`.
+/// When calling `call_host_function<T>`, this function is called internally to get the return
+/// value.
+pub fn get_host_return_value<T: TryFrom<ReturnValue>>() -> Result<T> {
     let return_value = try_pop_shared_input_data_into::<ReturnValue>()
         .expect("Unable to deserialize a return value from host");
-    if let ReturnValue::Void = return_value {
-        Ok(())
-    } else {
-        Err(HyperlightGuestError::new(
+    T::try_from(return_value).map_err(|_| {
+        HyperlightGuestError::new(
             ErrorCode::GuestError,
-            "Host return value was not void as expected".to_string(),
-        ))
-    }
+            format!(
+                "Host return value was not a {} as expected",
+                core::any::type_name::<T>()
+            ),
+        )
+    })
 }
 
-pub fn get_host_value_return_as_int() -> Result<i32> {
-    let return_value = try_pop_shared_input_data_into::<ReturnValue>()
-        .expect("Unable to deserialize return value from host");
-
-    // check that return value is an int and return
-    if let ReturnValue::Int(i) = return_value {
-        Ok(i)
-    } else {
-        Err(HyperlightGuestError::new(
-            ErrorCode::GuestError,
-            "Host return value was not an int as expected".to_string(),
-        ))
-    }
-}
-
-pub fn get_host_value_return_as_uint() -> Result<u32> {
-    let return_value = try_pop_shared_input_data_into::<ReturnValue>()
-        .expect("Unable to deserialize return value from host");
-
-    // check that return value is an int and return
-    if let ReturnValue::UInt(ui) = return_value {
-        Ok(ui)
-    } else {
-        Err(HyperlightGuestError::new(
-            ErrorCode::GuestError,
-            "Host return value was not a uint as expected".to_string(),
-        ))
-    }
-}
-
-pub fn get_host_value_return_as_long() -> Result<i64> {
-    let return_value = try_pop_shared_input_data_into::<ReturnValue>()
-        .expect("Unable to deserialize return value from host");
-
-    // check that return value is an int and return
-    if let ReturnValue::Long(l) = return_value {
-        Ok(l)
-    } else {
-        Err(HyperlightGuestError::new(
-            ErrorCode::GuestError,
-            "Host return value was not a long as expected".to_string(),
-        ))
-    }
-}
-
-pub fn get_host_value_return_as_ulong() -> Result<u64> {
-    let return_value = try_pop_shared_input_data_into::<ReturnValue>()
-        .expect("Unable to deserialize return value from host");
-
-    // check that return value is an int and return
-    if let ReturnValue::ULong(ul) = return_value {
-        Ok(ul)
-    } else {
-        Err(HyperlightGuestError::new(
-            ErrorCode::GuestError,
-            "Host return value was not a ulong as expected".to_string(),
-        ))
-    }
-}
-
-// TODO: Make this generic, return a Result<T, ErrorCode>
-
-pub fn get_host_value_return_as_vecbytes() -> Result<Vec<u8>> {
-    let return_value = try_pop_shared_input_data_into::<ReturnValue>()
-        .expect("Unable to deserialize return value from host");
-
-    // check that return value is an Vec<u8> and return
-    if let ReturnValue::VecBytes(v) = return_value {
-        Ok(v)
-    } else {
-        Err(HyperlightGuestError::new(
-            ErrorCode::GuestError,
-            "Host return value was not an VecBytes as expected".to_string(),
-        ))
-    }
-}
-
-// TODO: Make this generic, return a Result<T, ErrorCode> this should allow callers to call this function and get the result type they expect
-// without having to do the conversion themselves
-
-pub fn call_host_function(
+/// Internal function to call a host function without generic type parameters.
+/// This is used by both the Rust and C APIs to reduce code duplication.
+///
+/// This function doesn't return the host function result directly, instead it just
+/// performs the call. The result must be obtained by calling `get_host_return_value`.
+pub fn call_host_function_internal(
     function_name: &str,
     parameters: Option<Vec<ParameterValue>>,
     return_type: ReturnType,
@@ -144,73 +66,78 @@ pub fn call_host_function(
         return_type,
     );
 
-    validate_host_function_call(&host_function_call)?;
-
     let host_function_call_buffer: Vec<u8> = host_function_call
         .try_into()
         .expect("Unable to serialize host function call");
 
     push_shared_output_data(host_function_call_buffer)?;
 
-    outb(OutBAction::CallFunction as u16, 0);
+    outb(OutBAction::CallFunction as u16, &[0]);
 
     Ok(())
 }
 
-pub fn outb(port: u16, value: u8) {
-    unsafe {
-        match RUNNING_MODE {
-            RunMode::Hypervisor => {
-                hloutb(port, value);
-            }
-            RunMode::InProcessLinux | RunMode::InProcessWindows => {
-                if let Some(outb_func) = OUTB_PTR_WITH_CONTEXT {
-                    if let Some(peb_ptr) = P_PEB {
-                        outb_func((*peb_ptr).pOutbContext, port, value);
-                    }
-                } else if let Some(outb_func) = OUTB_PTR {
-                    outb_func(port, value);
-                } else {
-                    panic!("Tried to call outb without hypervisor and without outb function ptrs");
-                }
-            }
-            _ => {
-                panic!("Tried to call outb in invalid runmode");
-            }
-        }
+/// Call a host function with the given parameters and return type.
+/// This function serializes the function call and its parameters,
+/// sends it to the host, and then retrieves the return value.
+///
+/// The return value is deserialized into the specified type `T`.
+pub fn call_host_function<T: TryFrom<ReturnValue>>(
+    function_name: &str,
+    parameters: Option<Vec<ParameterValue>>,
+    return_type: ReturnType,
+) -> Result<T> {
+    call_host_function_internal(function_name, parameters, return_type)?;
+    get_host_return_value::<T>()
+}
 
-        check_for_host_error();
+pub fn outb(port: u16, data: &[u8]) {
+    unsafe {
+        let mut i = 0;
+        while i < data.len() {
+            let remaining = data.len() - i;
+            let chunk_len = remaining.min(3);
+            let mut chunk = [0u8; 4];
+            chunk[0] = chunk_len as u8;
+            chunk[1..1 + chunk_len].copy_from_slice(&data[i..i + chunk_len]);
+            let val = u32::from_le_bytes(chunk);
+            out32(port, val);
+            i += chunk_len;
+        }
     }
 }
 
-extern "win64" {
-    fn hloutb(port: u16, value: u8);
+pub(crate) unsafe fn out32(port: u16, val: u32) {
+    arch::asm!("out dx, eax", in("dx") port, in("eax") val, options(preserves_flags, nomem, nostack));
 }
 
-pub fn print_output_as_guest_function(function_call: &FunctionCall) -> Result<Vec<u8>> {
+/// Prints a message using `OutBAction::DebugPrint`. It transmits bytes of a message
+/// through several VMExists and, with such, it is slower than
+/// `print_output_with_host_print`.
+///
+/// This function should be used in debug mode only. This function does not
+/// require memory to be setup to be used.
+pub fn debug_print(msg: &str) {
+    outb(OutBAction::DebugPrint as u16, msg.as_bytes());
+}
+
+/// Print a message using the host's print function.
+///
+/// This function requires memory to be setup to be used. In particular, the
+/// existence of the input and output memory regions.
+pub fn print_output_with_host_print(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let ParameterValue::String(message) = function_call.parameters.clone().unwrap()[0].clone() {
-        call_host_function(
+        let res = call_host_function::<i32>(
             "HostPrint",
             Some(Vec::from(&[ParameterValue::String(message.to_string())])),
             ReturnType::Int,
         )?;
-        let res_i = get_host_value_return_as_int()?;
-        Ok(get_flatbuffer_result_from_int(res_i))
+
+        Ok(get_flatbuffer_result(res))
     } else {
         Err(HyperlightGuestError::new(
             ErrorCode::GuestError,
-            "Wrong Parameters passed to print_output_as_guest_function".to_string(),
+            "Wrong Parameters passed to print_output_with_host_print".to_string(),
         ))
     }
 }
-
-// port: RCX(cx), value: RDX(dl)
-global_asm!(
-    ".global hloutb
-        hloutb:
-            xor rax, rax
-            mov al, dl
-            mov dx, cx
-            out dx, al
-            ret"
-);

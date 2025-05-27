@@ -13,9 +13,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+#![allow(clippy::disallowed_macros)]
 extern crate hyperlight_host;
-use std::sync::{Arc, Mutex};
 
 use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnType};
 use hyperlight_host::sandbox::uninitialized::UninitializedSandbox;
@@ -32,22 +31,19 @@ fn fn_writer(_msg: String) -> Result<i32> {
 // by Hyperlight will also be emitted as log messages.
 
 fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::builder()
+        .parse_filters("none,hyperlight=info")
+        .init();
     // Get the path to a simple guest binary.
     let hyperlight_guest_path =
         simple_guest_as_string().expect("Cannot find the guest binary at the expected location.");
 
     for _ in 0..20 {
         let path = hyperlight_guest_path.clone();
-        let writer_func = Arc::new(Mutex::new(fn_writer));
         let res: Result<()> = {
             // Create a new sandbox.
-            let usandbox = UninitializedSandbox::new(
-                GuestBinary::FilePath(path),
-                None,
-                None,
-                Some(&writer_func),
-            )?;
+            let mut usandbox = UninitializedSandbox::new(GuestBinary::FilePath(path), None)?;
+            usandbox.register_print(fn_writer)?;
 
             // Initialize the sandbox.
 
@@ -85,12 +81,8 @@ fn main() -> Result<()> {
     }
 
     // Create a new sandbox.
-    let usandbox = UninitializedSandbox::new(
-        GuestBinary::FilePath(hyperlight_guest_path.clone()),
-        None,
-        None,
-        None,
-    )?;
+    let usandbox =
+        UninitializedSandbox::new(GuestBinary::FilePath(hyperlight_guest_path.clone()), None)?;
 
     // Initialize the sandbox.
 

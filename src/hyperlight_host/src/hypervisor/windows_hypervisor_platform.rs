@@ -28,12 +28,6 @@ use crate::hypervisor::wrappers::{WHvFPURegisters, WHvGeneralRegisters, WHvSpeci
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
 use crate::{new_error, Result};
 
-// We need to pass in a primitive array of register names/values
-// to WHvSetVirtualProcessorRegisters and rust needs to know array size
-// at compile time. There is an assert in set_virtual_process_registers
-// to ensure we never try and set more registers than this constant
-const REGISTER_COUNT: usize = 16;
-
 /// Interop calls for Windows Hypervisor Platform APIs
 ///
 /// Documentation can be found at:
@@ -53,7 +47,10 @@ pub(crate) fn is_hypervisor_present() -> bool {
         )
     } {
         Ok(_) => unsafe { capability.HypervisorPresent.as_bool() },
-        Err(_) => false,
+        Err(_) => {
+            log::info!("Windows Hypervisor Platform is not available on this system");
+            false
+        }
     }
 }
 
@@ -104,24 +101,28 @@ impl VMPartition {
         };
 
         regions.iter().try_for_each(|region| unsafe {
+            let flags = region
+                .flags
+                .iter()
+                .map(|flag| match flag {
+                    MemoryRegionFlags::NONE => Ok(WHvMapGpaRangeFlagNone),
+                    MemoryRegionFlags::READ => Ok(WHvMapGpaRangeFlagRead),
+                    MemoryRegionFlags::WRITE => Ok(WHvMapGpaRangeFlagWrite),
+                    MemoryRegionFlags::EXECUTE => Ok(WHvMapGpaRangeFlagExecute),
+                    MemoryRegionFlags::STACK_GUARD => Ok(WHvMapGpaRangeFlagNone),
+                    _ => Err(new_error!("Invalid Memory Region Flag")),
+                })
+                .collect::<Result<Vec<WHV_MAP_GPA_RANGE_FLAGS>>>()?
+                .iter()
+                .fold(WHvMapGpaRangeFlagNone, |acc, flag| acc | *flag); // collect using bitwise OR
+
             let res = whvmapgparange2_func(
                 self.0,
                 process_handle,
                 region.host_region.start as *const c_void,
                 region.guest_region.start as u64,
                 (region.guest_region.end - region.guest_region.start) as u64,
-                region
-                    .flags
-                    .iter()
-                    .filter_map(|flag| match flag {
-                        MemoryRegionFlags::NONE => Some(WHvMapGpaRangeFlagNone),
-                        MemoryRegionFlags::READ => Some(WHvMapGpaRangeFlagRead),
-                        MemoryRegionFlags::WRITE => Some(WHvMapGpaRangeFlagWrite),
-                        MemoryRegionFlags::EXECUTE => Some(WHvMapGpaRangeFlagExecute),
-                        MemoryRegionFlags::STACK_GUARD => None,
-                        _ => panic!("Invalid flag"),
-                    })
-                    .fold(WHvMapGpaRangeFlagNone, |acc, flag| acc | flag), // collect using bitwise OR,
+                flags,
             );
             if res.is_err() {
                 return Err(new_error!("Call to WHvMapGpaRange2 failed"));
@@ -161,6 +162,8 @@ pub unsafe fn try_load_whv_map_gpa_range2() -> Result<WHvMapGpaRange2Func> {
         return Err(new_error!("{}", e));
     }
 
+    #[allow(clippy::unwrap_used)]
+    // We know this will succeed because we just checked for an error above
     let library = library.unwrap();
 
     let address = unsafe { GetProcAddress(library, s!("WHvMapGpaRange2")) };
@@ -209,7 +212,6 @@ impl VMProcessor {
     ) -> Result<()> {
         let partition_handle = self.get_partition_hdl();
         let register_count = registers.len();
-        assert!(register_count <= REGISTER_COUNT);
         let mut register_names: Vec<WHV_REGISTER_NAME> = vec![];
         let mut register_values: Vec<WHV_REGISTER_VALUE> = vec![];
 
