@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,14 +17,20 @@ limitations under the License.
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnValue};
+use hyperlight_common::flatbuffer_wrappers::function_types::{
+    ParameterType, ParameterValue, ReturnType, ReturnValue,
+};
+use hyperlight_common::flatbuffer_wrappers::host_function_definition::HostFunctionDefinition;
+use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 
 use super::ExtraAllowedSyscall;
-use crate::func::host_functions::TypeErasedHostFunction;
 use crate::HyperlightError::HostFunctionNotFound;
-use crate::{new_error, Result};
+use crate::func::host_functions::TypeErasedHostFunction;
+use crate::mem::mgr::SandboxMemoryManager;
+use crate::mem::shared_mem::ExclusiveSharedMemory;
+use crate::{Result, new_error};
 
 #[derive(Default)]
 /// A Wrapper around details of functions exposed by the Host
@@ -32,9 +38,29 @@ pub struct FunctionRegistry {
     functions_map: HashMap<String, FunctionEntry>,
 }
 
+impl From<&mut FunctionRegistry> for HostFunctionDetails {
+    fn from(registry: &mut FunctionRegistry) -> Self {
+        let host_functions = registry
+            .functions_map
+            .iter()
+            .map(|(name, entry)| HostFunctionDefinition {
+                function_name: name.clone(),
+                parameter_types: Some(entry.parameter_types.to_vec()),
+                return_type: entry.return_type,
+            })
+            .collect();
+
+        HostFunctionDetails {
+            host_functions: Some(host_functions),
+        }
+    }
+}
+
 pub struct FunctionEntry {
     pub function: TypeErasedHostFunction,
     pub extra_allowed_syscalls: Option<Vec<ExtraAllowedSyscall>>,
+    pub parameter_types: &'static [ParameterType],
+    pub return_type: ReturnType,
 }
 
 impl FunctionRegistry {
@@ -43,22 +69,22 @@ impl FunctionRegistry {
     pub(crate) fn register_host_function(
         &mut self,
         name: String,
-        func: TypeErasedHostFunction,
+        func: FunctionEntry,
+        mgr: &mut SandboxMemoryManager<ExclusiveSharedMemory>,
     ) -> Result<()> {
-        self.register_host_function_helper(name, func, None)
-    }
+        self.functions_map.insert(name, func);
 
-    /// Register a host function with the sandbox, with a list of extra syscalls
-    /// that the function is allowed to make.
-    #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
-    #[cfg(all(feature = "seccomp", target_os = "linux"))]
-    pub(crate) fn register_host_function_with_syscalls(
-        &mut self,
-        name: String,
-        func: TypeErasedHostFunction,
-        extra_allowed_syscalls: Vec<ExtraAllowedSyscall>,
-    ) -> Result<()> {
-        self.register_host_function_helper(name, func, Some(extra_allowed_syscalls))
+        let hfd = HostFunctionDetails::from(self);
+
+        let buffer: Vec<u8> = (&hfd).try_into().map_err(|e| {
+            new_error!(
+                "Error serializing host function details to flatbuffer: {}",
+                e
+            )
+        })?;
+
+        mgr.write_buffer_host_function_details(&buffer)?;
+        Ok(())
     }
 
     /// Assuming a host function called `"HostPrint"` exists, and takes a
@@ -88,34 +114,13 @@ impl FunctionRegistry {
         self.call_host_func_impl(name, args)
     }
 
-    fn register_host_function_helper(
-        &mut self,
-        name: String,
-        function: TypeErasedHostFunction,
-        extra_allowed_syscalls: Option<Vec<ExtraAllowedSyscall>>,
-    ) -> Result<()> {
-        #[cfg(not(all(feature = "seccomp", target_os = "linux")))]
-        if extra_allowed_syscalls.is_some() {
-            return Err(new_error!(
-                "Extra syscalls are only supported on Linux with seccomp"
-            ));
-        }
-
-        self.functions_map.insert(
-            name,
-            FunctionEntry {
-                function,
-                extra_allowed_syscalls,
-            },
-        );
-        Ok(())
-    }
-
     #[instrument(err(Debug), skip_all, parent = Span::current(), level = "Trace")]
     fn call_host_func_impl(&self, name: &str, args: Vec<ParameterValue>) -> Result<ReturnValue> {
         let FunctionEntry {
             function,
             extra_allowed_syscalls,
+            parameter_types: _,
+            return_type: _,
         } = self
             .functions_map
             .get(name)
@@ -159,10 +164,12 @@ fn maybe_with_seccomp<T: Send>(
     // Use a scoped thread so that we can pass around references without having to clone them.
     crossbeam::thread::scope(|s| {
         s.builder()
-            .name(format!("Host Function Worker Thread for: {name:?}",))
+            .name(format!("Host Function Worker Thread for: {name:?}"))
             .spawn(move |_| {
                 let seccomp_filter = get_seccomp_filter_for_host_function_worker_thread(syscalls)?;
-                seccompiler::apply_filter(&seccomp_filter)?;
+                seccomp_filter
+                    .iter()
+                    .try_for_each(|filter| seccompiler::apply_filter(filter))?;
 
                 // We have a `catch_unwind` here because, if a disallowed syscall is issued,
                 // we handle it by panicking. This is to avoid returning execution to the

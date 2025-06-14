@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,20 +16,27 @@ limitations under the License.
 
 use std::sync::{Arc, Mutex};
 
+use hyperlight_common::flatbuffer_wrappers::function_call::{FunctionCall, FunctionCallType};
 use hyperlight_common::flatbuffer_wrappers::function_types::{
     ParameterValue, ReturnType, ReturnValue,
 };
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 
 use super::host_funcs::FunctionRegistry;
 use super::{MemMgrWrapper, WrapperGetter};
 use crate::func::call_ctx::MultiUseGuestCallContext;
-use crate::func::guest_dispatch::call_function_on_guest;
-use crate::hypervisor::hypervisor_handler::HypervisorHandler;
+use crate::func::guest_err::check_for_guest_error;
+use crate::func::{ParameterTuple, SupportedReturnType};
+#[cfg(gdb)]
+use crate::hypervisor::handlers::DbgMemAccessHandlerWrapper;
+use crate::hypervisor::handlers::{MemAccessHandlerCaller, OutBHandlerCaller};
+use crate::hypervisor::{Hypervisor, InterruptHandle};
+use crate::mem::ptr::RawPtr;
 use crate::mem::shared_mem::HostSharedMemory;
+use crate::metrics::maybe_time_and_emit_guest_call;
 use crate::sandbox_state::sandbox::{DevolvableSandbox, EvolvableSandbox, Sandbox};
 use crate::sandbox_state::transition::{MultiUseContextCallback, Noop};
-use crate::Result;
+use crate::{HyperlightError, Result};
 
 /// A sandbox that supports being used Multiple times.
 /// The implication of being used multiple times is two-fold:
@@ -43,26 +50,12 @@ pub struct MultiUseSandbox {
     // We need to keep a reference to the host functions, even if the compiler marks it as unused. The compiler cannot detect our dynamic usages of the host function in `HyperlightFunction::call`.
     pub(super) _host_funcs: Arc<Mutex<FunctionRegistry>>,
     pub(crate) mem_mgr: MemMgrWrapper<HostSharedMemory>,
-    hv_handler: HypervisorHandler,
-}
-
-// We need to implement drop to join the
-// threads, because, otherwise, we will
-// be leaking a thread with every
-// sandbox that is dropped. This was initially
-// caught by our benchmarks that created a ton of
-// sandboxes and caused the system to run out of
-// resources. Now, this is covered by the test:
-// `create_1000_sandboxes`.
-impl Drop for MultiUseSandbox {
-    fn drop(&mut self) {
-        match self.hv_handler.kill_hypervisor_handler_thread() {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("[POTENTIAL THREAD LEAK] Potentially failed to kill hypervisor handler thread when dropping MultiUseSandbox: {:?}", e);
-            }
-        }
-    }
+    vm: Box<dyn Hypervisor>,
+    out_hdl: Arc<Mutex<dyn OutBHandlerCaller>>,
+    mem_hdl: Arc<Mutex<dyn MemAccessHandlerCaller>>,
+    dispatch_ptr: RawPtr,
+    #[cfg(gdb)]
+    dbg_mem_access_fn: DbgMemAccessHandlerWrapper,
 }
 
 impl MultiUseSandbox {
@@ -75,12 +68,21 @@ impl MultiUseSandbox {
     pub(super) fn from_uninit(
         host_funcs: Arc<Mutex<FunctionRegistry>>,
         mgr: MemMgrWrapper<HostSharedMemory>,
-        hv_handler: HypervisorHandler,
+        vm: Box<dyn Hypervisor>,
+        out_hdl: Arc<Mutex<dyn OutBHandlerCaller>>,
+        mem_hdl: Arc<Mutex<dyn MemAccessHandlerCaller>>,
+        dispatch_ptr: RawPtr,
+        #[cfg(gdb)] dbg_mem_access_fn: DbgMemAccessHandlerWrapper,
     ) -> MultiUseSandbox {
         Self {
             _host_funcs: host_funcs,
             mem_mgr: mgr,
-            hv_handler,
+            vm,
+            out_hdl,
+            mem_hdl,
+            dispatch_ptr,
+            #[cfg(gdb)]
+            dbg_mem_access_fn,
         }
     }
 
@@ -155,15 +157,36 @@ impl MultiUseSandbox {
 
     /// Call a guest function by name, with the given return type and arguments.
     #[instrument(err(Debug), skip(self, args), parent = Span::current())]
-    pub fn call_guest_function_by_name(
+    pub fn call_guest_function_by_name<Output: SupportedReturnType>(
         &mut self,
         func_name: &str,
-        func_ret_type: ReturnType,
-        args: Option<Vec<ParameterValue>>,
+        args: impl ParameterTuple,
+    ) -> Result<Output> {
+        maybe_time_and_emit_guest_call(func_name, || {
+            let ret = self.call_guest_function_by_name_no_reset(
+                func_name,
+                Output::TYPE,
+                args.into_value(),
+            );
+            self.restore_state()?;
+            Output::from_value(ret?)
+        })
+    }
+
+    /// This function is kept here for fuzz testing the parameter and return types
+    #[cfg(feature = "fuzzing")]
+    #[instrument(err(Debug), skip(self, args), parent = Span::current())]
+    pub fn call_type_erased_guest_function_by_name(
+        &mut self,
+        func_name: &str,
+        ret_type: ReturnType,
+        args: Vec<ParameterValue>,
     ) -> Result<ReturnValue> {
-        let res = call_function_on_guest(self, func_name, func_ret_type, args);
-        self.restore_state()?;
-        res
+        maybe_time_and_emit_guest_call(func_name, || {
+            let ret = self.call_guest_function_by_name_no_reset(func_name, ret_type, args);
+            self.restore_state()?;
+            ret
+        })
     }
 
     /// Restore the Sandbox's state
@@ -171,6 +194,49 @@ impl MultiUseSandbox {
     pub(crate) fn restore_state(&mut self) -> Result<()> {
         let mem_mgr = self.mem_mgr.unwrap_mgr_mut();
         mem_mgr.restore_state_from_last_snapshot()
+    }
+
+    pub(crate) fn call_guest_function_by_name_no_reset(
+        &mut self,
+        function_name: &str,
+        return_type: ReturnType,
+        args: Vec<ParameterValue>,
+    ) -> Result<ReturnValue> {
+        let fc = FunctionCall::new(
+            function_name.to_string(),
+            Some(args),
+            FunctionCallType::Guest,
+            return_type,
+        );
+
+        let buffer: Vec<u8> = fc
+            .try_into()
+            .map_err(|_| HyperlightError::Error("Failed to serialize FunctionCall".to_string()))?;
+
+        self.get_mgr_wrapper_mut()
+            .as_mut()
+            .write_guest_function_call(&buffer)?;
+
+        self.vm.dispatch_call_from_host(
+            self.dispatch_ptr.clone(),
+            self.out_hdl.clone(),
+            self.mem_hdl.clone(),
+            #[cfg(gdb)]
+            self.dbg_mem_access_fn.clone(),
+        )?;
+
+        self.check_stack_guard()?;
+        check_for_guest_error(self.get_mgr_wrapper_mut())?;
+
+        self.get_mgr_wrapper_mut()
+            .as_mut()
+            .get_guest_function_call_result()
+    }
+
+    /// Get a handle to the interrupt handler for this sandbox,
+    /// capable of interrupting guest execution.
+    pub fn interrupt_handle(&self) -> Arc<dyn InterruptHandle> {
+        self.vm.interrupt_handle()
     }
 }
 
@@ -180,12 +246,6 @@ impl WrapperGetter for MultiUseSandbox {
     }
     fn get_mgr_wrapper_mut(&mut self) -> &mut MemMgrWrapper<HostSharedMemory> {
         &mut self.mem_mgr
-    }
-    fn get_hv_handler(&self) -> &HypervisorHandler {
-        &self.hv_handler
-    }
-    fn get_hv_handler_mut(&mut self) -> &mut HypervisorHandler {
-        &mut self.hv_handler
     }
 }
 
@@ -255,16 +315,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use hyperlight_common::flatbuffer_wrappers::function_types::{
-        ParameterValue, ReturnType, ReturnValue,
-    };
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use hyperlight_testing::simple_guest_as_string;
 
     use crate::func::call_ctx::MultiUseGuestCallContext;
-    use crate::sandbox::SandboxConfiguration;
+    use crate::sandbox::{Callable, SandboxConfiguration};
     use crate::sandbox_state::sandbox::{DevolvableSandbox, EvolvableSandbox};
     use crate::sandbox_state::transition::{MultiUseContextCallback, Noop};
-    use crate::{GuestBinary, MultiUseSandbox, UninitializedSandbox};
+    use crate::{GuestBinary, HyperlightError, MultiUseSandbox, Result, UninitializedSandbox};
 
     // Tests to ensure that many (1000) function calls can be made in a call context with a small stack (1K) and heap(14K).
     // This test effectively ensures that the stack is being properly reset after each call and we are not leaking memory in the Guest.
@@ -284,12 +344,7 @@ mod tests {
         let mut ctx = sbox1.new_call_context();
 
         for _ in 0..1000 {
-            ctx.call(
-                "Echo",
-                ReturnType::String,
-                Some(vec![ParameterValue::String("hello".to_string())]),
-            )
-            .unwrap();
+            ctx.call::<String>("Echo", "hello".to_string()).unwrap();
         }
 
         let sbox2: MultiUseSandbox = {
@@ -302,12 +357,9 @@ mod tests {
         let mut ctx = sbox2.new_call_context();
 
         for i in 0..1000 {
-            ctx.call(
+            ctx.call::<i32>(
                 "PrintUsingPrintf",
-                ReturnType::Int,
-                Some(vec![ParameterValue::String(
-                    format!("Hello World {}\n", i).to_string(),
-                )]),
+                format!("Hello World {}\n", i).to_string(),
             )
             .unwrap();
         }
@@ -325,23 +377,239 @@ mod tests {
         .unwrap();
 
         let func = Box::new(|call_ctx: &mut MultiUseGuestCallContext| {
-            call_ctx.call(
-                "AddToStatic",
-                ReturnType::Int,
-                Some(vec![ParameterValue::Int(5)]),
-            )?;
+            call_ctx.call::<i32>("AddToStatic", 5i32)?;
             Ok(())
         });
         let transition_func = MultiUseContextCallback::from(func);
         let mut sbox2 = sbox1.evolve(transition_func).unwrap();
-        let res = sbox2
-            .call_guest_function_by_name("GetStatic", ReturnType::Int, None)
-            .unwrap();
-        assert_eq!(res, ReturnValue::Int(5));
+        let res: i32 = sbox2.call_guest_function_by_name("GetStatic", ()).unwrap();
+        assert_eq!(res, 5);
         let mut sbox3: MultiUseSandbox = sbox2.devolve(Noop::default()).unwrap();
-        let res = sbox3
-            .call_guest_function_by_name("GetStatic", ReturnType::Int, None)
+        let res: i32 = sbox3.call_guest_function_by_name("GetStatic", ()).unwrap();
+        assert_eq!(res, 0);
+    }
+
+    #[test]
+    // TODO: Investigate why this test fails with an incorrect error when run alongside other tests
+    #[ignore]
+    #[cfg(target_os = "linux")]
+    fn test_violate_seccomp_filters() -> Result<()> {
+        fn make_get_pid_syscall() -> Result<u64> {
+            let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+            Ok(pid as u64)
+        }
+
+        // First, run  to make sure it fails.
+        {
+            let mut usbox = UninitializedSandbox::new(
+                GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
+                None,
+            )
             .unwrap();
-        assert_eq!(res, ReturnValue::Int(0));
+
+            usbox.register("MakeGetpidSyscall", make_get_pid_syscall)?;
+
+            let mut sbox: MultiUseSandbox = usbox.evolve(Noop::default())?;
+
+            let res: Result<u64> = sbox.call_guest_function_by_name("ViolateSeccompFilters", ());
+
+            #[cfg(feature = "seccomp")]
+            match res {
+                Ok(_) => panic!("Expected to fail due to seccomp violation"),
+                Err(e) => match e {
+                    HyperlightError::DisallowedSyscall => {}
+                    _ => panic!("Expected DisallowedSyscall error: {}", e),
+                },
+            }
+
+            #[cfg(not(feature = "seccomp"))]
+            match res {
+                Ok(_) => (),
+                Err(e) => panic!("Expected to succeed without seccomp: {}", e),
+            }
+        }
+
+        // Second, run with allowing `SYS_getpid`
+        #[cfg(feature = "seccomp")]
+        {
+            let mut usbox = UninitializedSandbox::new(
+                GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
+                None,
+            )
+            .unwrap();
+
+            usbox.register_with_extra_allowed_syscalls(
+                "MakeGetpidSyscall",
+                make_get_pid_syscall,
+                vec![libc::SYS_getpid],
+            )?;
+            // ^^^ note, we are allowing SYS_getpid
+
+            let mut sbox: MultiUseSandbox = usbox.evolve(Noop::default())?;
+
+            let res: Result<u64> = sbox.call_guest_function_by_name("ViolateSeccompFilters", ());
+
+            match res {
+                Ok(_) => {}
+                Err(e) => panic!("Expected to succeed due to seccomp violation: {}", e),
+            }
+        }
+
+        Ok(())
+    }
+
+    // We have a secomp specifically for `openat`, but we don't want to crash on `openat`, but rather make sure `openat` returns `EACCES`
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn violate_seccomp_filters_openat() -> Result<()> {
+        // Hostcall to call `openat`.
+        fn make_openat_syscall() -> Result<i64> {
+            use std::ffi::CString;
+
+            let path = CString::new("/proc/sys/vm/overcommit_memory").unwrap();
+
+            let fd_or_err = unsafe {
+                libc::syscall(
+                    libc::SYS_openat,
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    libc::O_RDONLY,
+                )
+            };
+
+            if fd_or_err == -1 {
+                Ok((-std::io::Error::last_os_error().raw_os_error().unwrap()).into())
+            } else {
+                Ok(fd_or_err)
+            }
+        }
+        {
+            // First make sure a regular call to `openat` on /proc/sys/vm/overcommit_memory succeeds
+            let ret = make_openat_syscall()?;
+            assert!(
+                ret >= 0,
+                "Expected openat syscall to succeed, got: {:?}",
+                ret
+            );
+
+            let mut ubox = UninitializedSandbox::new(
+                GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
+                None,
+            )
+            .unwrap();
+            ubox.register("Openat_Hostfunc", make_openat_syscall)?;
+
+            let mut sbox = ubox.evolve(Noop::default()).unwrap();
+            let host_func_result = sbox
+                .call_guest_function_by_name::<i64>(
+                    "CallGivenParamlessHostFuncThatReturnsI64",
+                    "Openat_Hostfunc".to_string(),
+                )
+                .expect("Expected to call host function that returns i64");
+
+            if cfg!(feature = "seccomp") {
+                // If seccomp is enabled, we expect the syscall to return EACCES, as setup by our seccomp filter
+                assert_eq!(host_func_result, -libc::EACCES as i64);
+            } else {
+                // If seccomp is not enabled, we expect the syscall to succeed
+                assert!(host_func_result >= 0);
+            }
+        }
+
+        #[cfg(feature = "seccomp")]
+        {
+            // Now let's make sure if we register the `openat` syscall as an extra allowed syscall, it will succeed
+            let mut ubox = UninitializedSandbox::new(
+                GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
+                None,
+            )
+            .unwrap();
+            ubox.register_with_extra_allowed_syscalls(
+                "Openat_Hostfunc",
+                make_openat_syscall,
+                [libc::SYS_openat],
+            )?;
+            let mut sbox = ubox.evolve(Noop::default()).unwrap();
+            let host_func_result = sbox
+                .call_guest_function_by_name::<i64>(
+                    "CallGivenParamlessHostFuncThatReturnsI64",
+                    "Openat_Hostfunc".to_string(),
+                )
+                .expect("Expected to call host function that returns i64");
+
+            // should pass regardless of seccomp feature
+            assert!(host_func_result >= 0);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_trigger_exception_on_guest() {
+        let usbox = UninitializedSandbox::new(
+            GuestBinary::FilePath(simple_guest_as_string().expect("Guest Binary Missing")),
+            None,
+        )
+        .unwrap();
+
+        let mut multi_use_sandbox: MultiUseSandbox = usbox.evolve(Noop::default()).unwrap();
+
+        let res: Result<()> = multi_use_sandbox.call_guest_function_by_name("TriggerException", ());
+
+        assert!(res.is_err());
+
+        match res.unwrap_err() {
+            HyperlightError::GuestAborted(_, msg) => {
+                // msg should indicate we got an invalid opcode exception
+                assert!(msg.contains("InvalidOpcode"));
+            }
+            e => panic!(
+                "Expected HyperlightError::GuestExecutionError but got {:?}",
+                e
+            ),
+        }
+    }
+
+    #[test]
+    #[ignore] // this test runs by itself because it uses a lot of system resources
+    fn create_1000_sandboxes() {
+        let barrier = Arc::new(Barrier::new(21));
+
+        let mut handles = vec![];
+
+        for _ in 0..20 {
+            let c = barrier.clone();
+
+            let handle = thread::spawn(move || {
+                c.wait();
+
+                for _ in 0..50 {
+                    let usbox = UninitializedSandbox::new(
+                        GuestBinary::FilePath(
+                            simple_guest_as_string().expect("Guest Binary Missing"),
+                        ),
+                        None,
+                    )
+                    .unwrap();
+
+                    let mut multi_use_sandbox: MultiUseSandbox =
+                        usbox.evolve(Noop::default()).unwrap();
+
+                    let res: i32 = multi_use_sandbox
+                        .call_guest_function_by_name("GetStatic", ())
+                        .unwrap();
+
+                    assert_eq!(res, 0);
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        barrier.wait();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

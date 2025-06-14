@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,14 +27,14 @@ extern crate mshv_ioctls3 as mshv_ioctls;
 use std::collections::HashMap;
 
 use mshv_bindings::{
-    DebugRegisters, StandardRegisters, HV_TRANSLATE_GVA_VALIDATE_READ,
-    HV_TRANSLATE_GVA_VALIDATE_WRITE,
+    DebugRegisters, HV_TRANSLATE_GVA_VALIDATE_READ, HV_TRANSLATE_GVA_VALIDATE_WRITE,
+    StandardRegisters,
 };
 use mshv_ioctls::VcpuFd;
 
-use super::arch::{vcpu_stop_reason, MAX_NO_OF_HW_BP, SW_BP_SIZE};
+use super::arch::{MAX_NO_OF_HW_BP, SW_BP_SIZE, vcpu_stop_reason};
 use super::{GuestDebug, VcpuStopReason, X86_64Regs};
-use crate::{new_error, HyperlightError, Result};
+use crate::{HyperlightError, Result, new_error};
 
 #[derive(Debug, Default)]
 pub(crate) struct MshvDebug {

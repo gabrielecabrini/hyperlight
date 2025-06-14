@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -73,10 +73,6 @@ pub(crate) mod testing;
 
 /// The re-export for the `HyperlightError` type
 pub use error::HyperlightError;
-/// The re-export for the `is_hypervisor_present` type
-pub use sandbox::is_hypervisor_present;
-/// The re-export for the `GuestBinary` type
-pub use sandbox::uninitialized::GuestBinary;
 /// Re-export for `HypervisorWrapper` trait
 /// Re-export for `MemMgrWrapper` type
 /// A sandbox that can call be used to make multiple calls to guest functions,
@@ -84,6 +80,10 @@ pub use sandbox::uninitialized::GuestBinary;
 pub use sandbox::MultiUseSandbox;
 /// The re-export for the `UninitializedSandbox` type
 pub use sandbox::UninitializedSandbox;
+/// The re-export for the `is_hypervisor_present` type
+pub use sandbox::is_hypervisor_present;
+/// The re-export for the `GuestBinary` type
+pub use sandbox::uninitialized::GuestBinary;
 
 /// The re-export for the `MultiUseGuestCallContext` type`
 pub use crate::func::call_ctx::MultiUseGuestCallContext;

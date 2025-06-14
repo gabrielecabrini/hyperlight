@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,8 +18,6 @@ limitations under the License.
 /// functions on the same Hyperlight sandbox instance, all from within the
 /// same state and mutual exclusion context.
 pub mod call_ctx;
-/// Functionality to dispatch a call from the host to the guest
-pub(crate) mod guest_dispatch;
 /// Functionality to check for errors after a guest call
 pub(crate) mod guest_err;
 /// Definitions and functionality to enable guest-to-host function calling,
@@ -40,7 +38,7 @@ pub(crate) mod param_type;
 pub(crate) mod ret_type;
 
 /// Re-export for `HostFunction` trait
-pub use host_functions::HostFunction;
+pub use host_functions::{HostFunction, Registerable};
 /// Re-export for `ParameterValue` enum
 pub use hyperlight_common::flatbuffer_wrappers::function_types::ParameterValue;
 /// Re-export for `ReturnType` enum

@@ -21,9 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: hyperlight-dev/ci-setup-workflow@v1.3.0
+      - uses: hyperlight-dev/ci-setup-workflow@v1.5.0
         with:
-          rust-toolchain: "1.81.0"
+          rust-toolchain: "1.85"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -41,9 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: hyperlight-dev/ci-setup-workflow@v1.3.0
+      - uses: hyperlight-dev/ci-setup-workflow@v1.5.0
         with:
-          rust-toolchain: "1.81.0"
+          rust-toolchain: "1.85"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -100,9 +100,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - uses: hyperlight-dev/ci-setup-workflow@v1.3.0
+      - uses: hyperlight-dev/ci-setup-workflow@v1.5.0
         with:
-          rust-toolchain: "1.81.0"
+          rust-toolchain: "1.85"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,8 +30,6 @@ use bitflags::bitflags;
 #[cfg(mshv)]
 use hyperlight_common::mem::PAGE_SHIFT;
 use hyperlight_common::mem::PAGE_SIZE_USIZE;
-#[cfg(mshv)]
-use mshv_bindings::{hv_x64_memory_intercept_message, mshv_user_mem_region};
 #[cfg(mshv2)]
 use mshv_bindings::{
     HV_MAP_GPA_EXECUTABLE, HV_MAP_GPA_PERMISSIONS_NONE, HV_MAP_GPA_READABLE, HV_MAP_GPA_WRITABLE,
@@ -40,8 +38,14 @@ use mshv_bindings::{
 use mshv_bindings::{
     MSHV_SET_MEM_BIT_EXECUTABLE, MSHV_SET_MEM_BIT_UNMAP, MSHV_SET_MEM_BIT_WRITABLE,
 };
+#[cfg(mshv)]
+use mshv_bindings::{hv_x64_memory_intercept_message, mshv_user_mem_region};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Hypervisor::{self, WHV_MEMORY_ACCESS_TYPE};
+
+use super::mgr::{PAGE_NX, PAGE_PRESENT, PAGE_RW, PAGE_USER};
+
+pub(crate) const DEFAULT_GUEST_BLOB_MEM_FLAGS: MemoryRegionFlags = MemoryRegionFlags::READ;
 
 bitflags! {
     /// flags representing memory permission for a memory region
@@ -57,6 +61,30 @@ bitflags! {
         const EXECUTE = 4;
         /// identifier that this is a stack guard page
         const STACK_GUARD = 8;
+    }
+}
+
+impl MemoryRegionFlags {
+    pub(crate) fn translate_flags(&self) -> u64 {
+        let mut page_flags = 0;
+
+        page_flags |= PAGE_PRESENT; // Mark page as present
+
+        if self.contains(MemoryRegionFlags::WRITE) {
+            page_flags |= PAGE_RW; // Allow read/write
+        }
+
+        if self.contains(MemoryRegionFlags::STACK_GUARD) {
+            page_flags |= PAGE_RW; // The guard page is marked RW so that if it gets written to we can detect it in the host
+        }
+
+        if self.contains(MemoryRegionFlags::EXECUTE) {
+            page_flags |= PAGE_USER; // Allow user access
+        } else {
+            page_flags |= PAGE_NX; // Mark as non-executable if EXECUTE is not set
+        }
+
+        page_flags
     }
 }
 
@@ -129,8 +157,12 @@ pub enum MemoryRegionType {
     PageTables,
     /// The region contains the guest's code
     Code,
+    /// The region contains the guest's init data
+    InitData,
     /// The region contains the PEB
     Peb,
+    /// The region contains the Host Function Definitions
+    HostFunctionDefinitions,
     /// The region contains the Input Data
     InputData,
     /// The region contains the Output Data

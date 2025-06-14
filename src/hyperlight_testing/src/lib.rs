@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ limitations under the License.
 use std::env;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 pub const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 pub mod logger;
@@ -75,6 +75,14 @@ pub fn simple_guest_as_string() -> Result<String> {
 /// Get a fully qualified OS-specific path to the callbackguest elf binary
 pub fn callback_guest_as_string() -> Result<String> {
     let buf = rust_guest_as_pathbuf("callbackguest");
+    buf.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("couldn't convert callback guest PathBuf to string"))
+}
+
+/// Get a fully-qualified OS-specific path to the witguest elf binary
+pub fn wit_guest_as_string() -> Result<String> {
+    let buf = rust_guest_as_pathbuf("witguest");
     buf.to_str()
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow!("couldn't convert callback guest PathBuf to string"))

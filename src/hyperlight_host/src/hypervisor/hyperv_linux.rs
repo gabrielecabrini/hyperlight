@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,29 +25,33 @@ extern crate mshv_bindings3 as mshv_bindings;
 extern crate mshv_ioctls3 as mshv_ioctls;
 
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use log::{error, LevelFilter};
+use log::{LevelFilter, error};
 #[cfg(mshv2)]
 use mshv_bindings::hv_message;
-#[cfg(gdb)]
 use mshv_bindings::{
-    hv_intercept_parameters, hv_intercept_type_HV_INTERCEPT_TYPE_EXCEPTION,
-    hv_message_type_HVMSG_X64_EXCEPTION_INTERCEPT, mshv_install_intercept,
-    HV_INTERCEPT_ACCESS_MASK_EXECUTE,
-};
-use mshv_bindings::{
-    hv_message_type, hv_message_type_HVMSG_GPA_INTERCEPT, hv_message_type_HVMSG_UNMAPPED_GPA,
+    FloatingPointUnit, SegmentRegister, SpecialRegisters, StandardRegisters, hv_message_type,
+    hv_message_type_HVMSG_GPA_INTERCEPT, hv_message_type_HVMSG_UNMAPPED_GPA,
     hv_message_type_HVMSG_X64_HALT, hv_message_type_HVMSG_X64_IO_PORT_INTERCEPT, hv_register_assoc,
     hv_register_name_HV_X64_REGISTER_RIP, hv_register_value, mshv_user_mem_region,
-    FloatingPointUnit, SegmentRegister, SpecialRegisters, StandardRegisters,
+};
+#[cfg(gdb)]
+use mshv_bindings::{
+    HV_INTERCEPT_ACCESS_MASK_EXECUTE, hv_intercept_parameters,
+    hv_intercept_type_HV_INTERCEPT_TYPE_EXCEPTION, hv_message_type_HVMSG_X64_EXCEPTION_INTERCEPT,
+    mshv_install_intercept,
 };
 #[cfg(mshv3)]
 use mshv_bindings::{
     hv_partition_property_code_HV_PARTITION_PROPERTY_SYNTHETIC_PROC_FEATURES,
     hv_partition_synthetic_processor_features,
 };
-use mshv_ioctls::{Mshv, VcpuFd, VmFd};
-use tracing::{instrument, Span};
+use mshv_ioctls::{Mshv, MshvError, VcpuFd, VmFd};
+use tracing::{Span, instrument};
+#[cfg(crashdump)]
+use {super::crashdump, std::path::Path};
 
 use super::fpu::{FP_CONTROL_WORD_DEFAULT, FP_TAG_WORD_DEFAULT, MXCSR_DEFAULT};
 #[cfg(gdb)]
@@ -56,16 +60,19 @@ use super::gdb::{DebugCommChannel, DebugMsg, DebugResponse, GuestDebug, MshvDebu
 use super::handlers::DbgMemAccessHandlerWrapper;
 use super::handlers::{MemAccessHandlerWrapper, OutBHandlerWrapper};
 use super::{
-    Hypervisor, VirtualCPU, CR0_AM, CR0_ET, CR0_MP, CR0_NE, CR0_PE, CR0_PG, CR0_WP, CR4_OSFXSR,
-    CR4_OSXMMEXCPT, CR4_PAE, EFER_LMA, EFER_LME, EFER_NX, EFER_SCE,
+    CR0_AM, CR0_ET, CR0_MP, CR0_NE, CR0_PE, CR0_PG, CR0_WP, CR4_OSFXSR, CR4_OSXMMEXCPT, CR4_PAE,
+    EFER_LMA, EFER_LME, EFER_NX, EFER_SCE, Hypervisor, InterruptHandle, LinuxInterruptHandle,
+    VirtualCPU,
 };
-use crate::hypervisor::hypervisor_handler::HypervisorHandler;
+#[cfg(gdb)]
+use crate::HyperlightError;
 use crate::hypervisor::HyperlightExit;
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
 use crate::mem::ptr::{GuestPtr, RawPtr};
-#[cfg(gdb)]
-use crate::HyperlightError;
-use crate::{log_then_return, new_error, Result};
+use crate::sandbox::SandboxConfiguration;
+#[cfg(crashdump)]
+use crate::sandbox::uninitialized::SandboxRuntimeConfig;
+use crate::{Result, log_then_return, new_error};
 
 #[cfg(gdb)]
 mod debug {
@@ -75,7 +82,7 @@ mod debug {
     use super::{HypervLinuxDriver, *};
     use crate::hypervisor::gdb::{DebugMsg, DebugResponse, VcpuStopReason, X86_64Regs};
     use crate::hypervisor::handlers::DbgMemAccessHandlerCaller;
-    use crate::{new_error, Result};
+    use crate::{Result, new_error};
 
     impl HypervLinuxDriver {
         /// Resets the debug information to disable debugging
@@ -286,18 +293,21 @@ pub(crate) fn is_hypervisor_present() -> bool {
 
 /// A Hypervisor driver for HyperV-on-Linux. This hypervisor is often
 /// called the Microsoft Hypervisor (MSHV)
-pub(super) struct HypervLinuxDriver {
+pub(crate) struct HypervLinuxDriver {
     _mshv: Mshv,
     vm_fd: VmFd,
     vcpu_fd: VcpuFd,
     entrypoint: u64,
     mem_regions: Vec<MemoryRegion>,
     orig_rsp: GuestPtr,
+    interrupt_handle: Arc<LinuxInterruptHandle>,
 
     #[cfg(gdb)]
     debug: Option<MshvDebug>,
     #[cfg(gdb)]
     gdb_conn: Option<DebugCommChannel<DebugResponse, DebugMsg>>,
+    #[cfg(crashdump)]
+    rt_cfg: SandboxRuntimeConfig,
 }
 
 impl HypervLinuxDriver {
@@ -310,12 +320,14 @@ impl HypervLinuxDriver {
     /// `apply_registers` method to do that, or more likely call
     /// `initialise` to do it for you.
     #[instrument(skip_all, parent = Span::current(), level = "Trace")]
-    pub(super) fn new(
+    pub(crate) fn new(
         mem_regions: Vec<MemoryRegion>,
         entrypoint_ptr: GuestPtr,
         rsp_ptr: GuestPtr,
         pml4_ptr: GuestPtr,
+        config: &SandboxConfiguration,
         #[cfg(gdb)] gdb_conn: Option<DebugCommChannel<DebugResponse, DebugMsg>>,
+        #[cfg(crashdump)] rt_cfg: SandboxRuntimeConfig,
     ) -> Result<Self> {
         let mshv = Mshv::new()?;
         let pr = Default::default();
@@ -390,11 +402,34 @@ impl HypervLinuxDriver {
             mem_regions,
             entrypoint: entrypoint_ptr.absolute()?,
             orig_rsp: rsp_ptr,
+            interrupt_handle: Arc::new(LinuxInterruptHandle {
+                running: AtomicU64::new(0),
+                cancel_requested: AtomicBool::new(false),
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_vendor = "unknown",
+                    target_os = "linux",
+                    target_env = "musl"
+                ))]
+                tid: AtomicU64::new(unsafe { libc::pthread_self() as u64 }),
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_vendor = "unknown",
+                    target_os = "linux",
+                    target_env = "musl"
+                )))]
+                tid: AtomicU64::new(unsafe { libc::pthread_self() }),
+                retry_delay: config.get_interrupt_retry_delay(),
+                sig_rt_min_offset: config.get_interrupt_vcpu_sigrtmin_offset(),
+                dropped: AtomicBool::new(false),
+            }),
 
             #[cfg(gdb)]
             debug,
             #[cfg(gdb)]
             gdb_conn,
+            #[cfg(crashdump)]
+            rt_cfg,
         })
     }
 
@@ -461,7 +496,6 @@ impl Hypervisor for HypervLinuxDriver {
         page_size: u32,
         outb_hdl: OutBHandlerWrapper,
         mem_access_hdl: MemAccessHandlerWrapper,
-        hv_handler: Option<HypervisorHandler>,
         max_guest_log_level: Option<LevelFilter>,
         #[cfg(gdb)] dbg_mem_access_fn: DbgMemAccessHandlerWrapper,
     ) -> Result<()> {
@@ -487,7 +521,6 @@ impl Hypervisor for HypervLinuxDriver {
 
         VirtualCPU::run(
             self.as_mut_hypervisor(),
-            hv_handler,
             outb_hdl,
             mem_access_hdl,
             #[cfg(gdb)]
@@ -503,7 +536,6 @@ impl Hypervisor for HypervLinuxDriver {
         dispatch_func_addr: RawPtr,
         outb_handle_fn: OutBHandlerWrapper,
         mem_access_fn: MemAccessHandlerWrapper,
-        hv_handler: Option<HypervisorHandler>,
         #[cfg(gdb)] dbg_mem_access_fn: DbgMemAccessHandlerWrapper,
     ) -> Result<()> {
         // Reset general purpose registers, then set RIP and RSP
@@ -527,7 +559,6 @@ impl Hypervisor for HypervLinuxDriver {
         // run
         VirtualCPU::run(
             self.as_mut_hypervisor(),
-            hv_handler,
             outb_handle_fn,
             mem_access_fn,
             #[cfg(gdb)]
@@ -577,15 +608,62 @@ impl Hypervisor for HypervLinuxDriver {
         #[cfg(gdb)]
         const EXCEPTION_INTERCEPT: hv_message_type = hv_message_type_HVMSG_X64_EXCEPTION_INTERCEPT;
 
-        #[cfg(mshv2)]
-        let run_result = {
-            let hv_message: hv_message = Default::default();
-            &self.vcpu_fd.run(hv_message)
+        self.interrupt_handle
+            .tid
+            .store(unsafe { libc::pthread_self() as u64 }, Ordering::Relaxed);
+        // Note: if a `InterruptHandle::kill()` called while this thread is **here**
+        // Then this is fine since `cancel_requested` is set to true, so we will skip the `VcpuFd::run()` call
+        self.interrupt_handle
+            .set_running_and_increment_generation()
+            .map_err(|e| {
+                new_error!(
+                    "Error setting running state and incrementing generation: {}",
+                    e
+                )
+            })?;
+        // Don't run the vcpu if `cancel_requested` is true
+        //
+        // Note: if a `InterruptHandle::kill()` called while this thread is **here**
+        // Then this is fine since `cancel_requested` is set to true, so we will skip the `VcpuFd::run()` call
+        let exit_reason = if self
+            .interrupt_handle
+            .cancel_requested
+            .load(Ordering::Relaxed)
+        {
+            Err(MshvError::Errno(vmm_sys_util::errno::Error::new(
+                libc::EINTR,
+            )))
+        } else {
+            // Note: if a `InterruptHandle::kill()` called while this thread is **here**
+            // Then the vcpu will run, but we will keep sending signals to this thread
+            // to interrupt it until `running` is set to false. The `vcpu_fd::run()` call will
+            // return either normally with an exit reason, or from being "kicked" by out signal handler, with an EINTR error,
+            // both of which are fine.
+            #[cfg(mshv2)]
+            {
+                let hv_message: hv_message = Default::default();
+                self.vcpu_fd.run(hv_message)
+            }
+            #[cfg(mshv3)]
+            self.vcpu_fd.run()
         };
-        #[cfg(mshv3)]
-        let run_result = &self.vcpu_fd.run();
-
-        let result = match run_result {
+        // Note: if a `InterruptHandle::kill()` called while this thread is **here**
+        // Then signals will be sent to this thread until `running` is set to false.
+        // This is fine since the signal handler is a no-op.
+        let cancel_requested = self
+            .interrupt_handle
+            .cancel_requested
+            .load(Ordering::Relaxed);
+        // Note: if a `InterruptHandle::kill()` called while this thread is **here**
+        // Then `cancel_requested` will be set to true again, which will cancel the **next vcpu run**.
+        // Additionally signals will be sent to this thread until `running` is set to false.
+        // This is fine since the signal handler is a no-op.
+        self.interrupt_handle.clear_running_bit();
+        // At this point, `running` is false so no more signals will be sent to this thread,
+        // but we may still receive async signals that were sent before this point.
+        // To prevent those signals from interrupting subsequent calls to `run()`,
+        // we make sure to check `cancel_requested` before cancelling (see `libc::EINTR` match-arm below).
+        let result = match exit_reason {
             Ok(m) => match m.header.message_type {
                 HALT_MESSAGE => {
                     crate::debug!("mshv - Halt Details : {:#?}", &self);
@@ -662,7 +740,18 @@ impl Hypervisor for HypervLinuxDriver {
             },
             Err(e) => match e.errno() {
                 // we send a signal to the thread to cancel execution this results in EINTR being returned by KVM so we return Cancelled
-                libc::EINTR => HyperlightExit::Cancelled(),
+                libc::EINTR => {
+                    // If cancellation was not requested for this specific vm, the vcpu was interrupted because of stale signal
+                    // that was meant to be delivered to a previous/other vcpu on this same thread, so let's ignore it
+                    if cancel_requested {
+                        self.interrupt_handle
+                            .cancel_requested
+                            .store(false, Ordering::Relaxed);
+                        HyperlightExit::Cancelled()
+                    } else {
+                        HyperlightExit::Retry()
+                    }
+                }
                 libc::EAGAIN => HyperlightExit::Retry(),
                 _ => {
                     crate::debug!("mshv Error - Details: Error: {} \n {:#?}", e, &self);
@@ -678,9 +767,66 @@ impl Hypervisor for HypervLinuxDriver {
         self as &mut dyn Hypervisor
     }
 
+    fn interrupt_handle(&self) -> Arc<dyn InterruptHandle> {
+        self.interrupt_handle.clone()
+    }
+
     #[cfg(crashdump)]
-    fn get_memory_regions(&self) -> &[MemoryRegion] {
-        &self.mem_regions
+    fn crashdump_context(&self) -> Result<Option<super::crashdump::CrashDumpContext>> {
+        if self.rt_cfg.guest_core_dump {
+            let mut regs = [0; 27];
+
+            let vcpu_regs = self.vcpu_fd.get_regs()?;
+            let sregs = self.vcpu_fd.get_sregs()?;
+            let xsave = self.vcpu_fd.get_xsave()?;
+
+            // Set up the registers for the crash dump
+            regs[0] = vcpu_regs.r15; // r15
+            regs[1] = vcpu_regs.r14; // r14
+            regs[2] = vcpu_regs.r13; // r13
+            regs[3] = vcpu_regs.r12; // r12
+            regs[4] = vcpu_regs.rbp; // rbp
+            regs[5] = vcpu_regs.rbx; // rbx
+            regs[6] = vcpu_regs.r11; // r11
+            regs[7] = vcpu_regs.r10; // r10
+            regs[8] = vcpu_regs.r9; // r9
+            regs[9] = vcpu_regs.r8; // r8
+            regs[10] = vcpu_regs.rax; // rax
+            regs[11] = vcpu_regs.rcx; // rcx
+            regs[12] = vcpu_regs.rdx; // rdx
+            regs[13] = vcpu_regs.rsi; // rsi
+            regs[14] = vcpu_regs.rdi; // rdi
+            regs[15] = 0; // orig rax
+            regs[16] = vcpu_regs.rip; // rip
+            regs[17] = sregs.cs.selector as u64; // cs
+            regs[18] = vcpu_regs.rflags; // eflags
+            regs[19] = vcpu_regs.rsp; // rsp
+            regs[20] = sregs.ss.selector as u64; // ss
+            regs[21] = sregs.fs.base; // fs_base
+            regs[22] = sregs.gs.base; // gs_base
+            regs[23] = sregs.ds.selector as u64; // ds
+            regs[24] = sregs.es.selector as u64; // es
+            regs[25] = sregs.fs.selector as u64; // fs
+            regs[26] = sregs.gs.selector as u64; // gs
+
+            // Get the filename from the binary path
+            let filename = self.rt_cfg.binary_path.clone().and_then(|path| {
+                Path::new(&path)
+                    .file_name()
+                    .and_then(|name| name.to_os_string().into_string().ok())
+            });
+
+            Ok(Some(crashdump::CrashDumpContext::new(
+                &self.mem_regions,
+                regs,
+                xsave.buffer.to_vec(),
+                self.entrypoint,
+                self.rt_cfg.binary_path.clone(),
+                filename,
+            )))
+        } else {
+            Ok(None)
+        }
     }
 
     #[cfg(gdb)]
@@ -732,6 +878,7 @@ impl Hypervisor for HypervLinuxDriver {
 impl Drop for HypervLinuxDriver {
     #[instrument(skip_all, parent = Span::current(), level = "Trace")]
     fn drop(&mut self) {
+        self.interrupt_handle.dropped.store(true, Ordering::Relaxed);
         for region in &self.mem_regions {
             let mshv_region: mshv_user_mem_region = region.to_owned().into();
             match self.vm_fd.unmap_user_memory(mshv_region) {
@@ -793,13 +940,25 @@ mod tests {
             MemoryRegionFlags::READ | MemoryRegionFlags::WRITE | MemoryRegionFlags::EXECUTE,
             crate::mem::memory_region::MemoryRegionType::Code,
         );
+        let config: SandboxConfiguration = Default::default();
+
         super::HypervLinuxDriver::new(
             regions.build(),
             entrypoint_ptr,
             rsp_ptr,
             pml4_ptr,
+            &config,
             #[cfg(gdb)]
             None,
+            #[cfg(crashdump)]
+            SandboxRuntimeConfig {
+                #[cfg(crashdump)]
+                binary_path: None,
+                #[cfg(gdb)]
+                debug_info: None,
+                #[cfg(crashdump)]
+                guest_core_dump: true,
+            },
         )
         .unwrap();
     }

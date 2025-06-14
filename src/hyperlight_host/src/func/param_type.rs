@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterType, ParameterValue};
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 
 use super::utils::for_each_tuple;
 use crate::HyperlightError::{ParameterValueConversionFailure, UnexpectedNoOfArguments};
-use crate::{log_then_return, Result};
+use crate::{Result, log_then_return};
 
 /// This is a marker trait that is used to indicate that a type is a
 /// valid Hyperlight parameter type.
@@ -45,6 +45,8 @@ macro_rules! for_each_param_type {
         $macro!(u32, UInt);
         $macro!(i64, Long);
         $macro!(u64, ULong);
+        $macro!(f32, Float);
+        $macro!(f64, Double);
         $macro!(bool, Bool);
         $macro!(Vec<u8>, VecBytes);
     };
@@ -92,6 +94,27 @@ pub trait ParameterTuple: Sized + Clone + Send + Sync + 'static {
 
     /// Get the actual inner value of this `SupportedParameterType`
     fn from_value(value: Vec<ParameterValue>) -> Result<Self>;
+}
+
+impl<T: SupportedParameterType> ParameterTuple for T {
+    const SIZE: usize = 1;
+
+    const TYPE: &[ParameterType] = &[T::TYPE];
+
+    #[instrument(skip_all, parent = Span::current(), level= "Trace")]
+    fn into_value(self) -> Vec<ParameterValue> {
+        vec![self.into_value()]
+    }
+
+    #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
+    fn from_value(value: Vec<ParameterValue>) -> Result<Self> {
+        match <[ParameterValue; 1]>::try_from(value) {
+            Ok([val]) => Ok(T::from_value(val)?),
+            Err(value) => {
+                log_then_return!(UnexpectedNoOfArguments(value.len(), 1));
+            }
+        }
+    }
 }
 
 macro_rules! impl_param_tuple {

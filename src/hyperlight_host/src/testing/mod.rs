@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use hyperlight_testing::rust_guest_as_pathbuf;
 
 use crate::mem::exe::ExeInfo;
-use crate::{new_error, Result};
+use crate::{Result, new_error};
 pub(crate) mod log_values;
 
 /// Get an `ExeInfo` representing `simpleguest.exe`

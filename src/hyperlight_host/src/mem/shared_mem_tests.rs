@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ use std::mem::size_of;
 
 use hyperlight_common::mem::PAGE_SIZE_USIZE;
 
-use crate::{log_then_return, new_error, Result};
+use crate::{Result, log_then_return, new_error};
 
 /// A function that knows how to read data of type `T` from a
 /// `SharedMemory` at a specified offset

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,19 +14,355 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::disallowed_macros)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::Duration;
+
 use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::mem::PAGE_SIZE;
-use hyperlight_host::func::{ParameterValue, ReturnType, ReturnValue};
 use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::sandbox_state::sandbox::EvolvableSandbox;
 use hyperlight_host::sandbox_state::transition::Noop;
 use hyperlight_host::{GuestBinary, HyperlightError, MultiUseSandbox, UninitializedSandbox};
-use hyperlight_testing::simplelogger::{SimpleLogger, LOGGER};
-use hyperlight_testing::{c_simple_guest_as_string, simple_guest_as_string};
+use hyperlight_testing::simplelogger::{LOGGER, SimpleLogger};
+use hyperlight_testing::{
+    c_simple_guest_as_string, callback_guest_as_string, simple_guest_as_string,
+};
 use log::LevelFilter;
 
 pub mod common; // pub to disable dead_code warning
 use crate::common::{new_uninit, new_uninit_rust};
+
+// A host function cannot be interrupted, but we can at least make sure after requesting to interrupt a host call,
+// we don't re-enter the guest again once the host call is done
+#[test]
+fn interrupt_host_call() {
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier2 = barrier.clone();
+
+    let mut usbox = UninitializedSandbox::new(
+        GuestBinary::FilePath(callback_guest_as_string().expect("Guest Binary Missing")),
+        None,
+    )
+    .unwrap();
+
+    let spin = move || {
+        barrier2.wait();
+        thread::sleep(std::time::Duration::from_secs(1));
+        Ok(())
+    };
+
+    #[cfg(any(target_os = "windows", not(feature = "seccomp")))]
+    usbox.register("Spin", spin).unwrap();
+
+    #[cfg(all(target_os = "linux", feature = "seccomp"))]
+    usbox
+        .register_with_extra_allowed_syscalls("Spin", spin, vec![libc::SYS_clock_nanosleep])
+        .unwrap();
+
+    let mut sandbox: MultiUseSandbox = usbox.evolve(Noop::default()).unwrap();
+    let interrupt_handle = sandbox.interrupt_handle();
+    assert!(!interrupt_handle.dropped()); // not yet dropped
+
+    let thread = thread::spawn({
+        move || {
+            barrier.wait(); // wait for the host function to be entered
+            interrupt_handle.kill(); // send kill once host call is in progress
+        }
+    });
+
+    let result = sandbox
+        .call_guest_function_by_name::<i32>("CallHostSpin", ())
+        .unwrap_err();
+    assert!(matches!(result, HyperlightError::ExecutionCanceledByHost()));
+
+    thread.join().unwrap();
+}
+
+/// Makes sure a running guest call can be interrupted by the host
+#[test]
+fn interrupt_in_progress_guest_call() {
+    let mut sbox1: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier2 = barrier.clone();
+    let interrupt_handle = sbox1.interrupt_handle();
+    assert!(!interrupt_handle.dropped()); // not yet dropped
+
+    // kill vm after 1 second
+    let thread = thread::spawn(move || {
+        thread::sleep(Duration::from_secs(1));
+        assert!(interrupt_handle.kill());
+        barrier2.wait(); // wait here until main thread has returned from the interrupted guest call
+        barrier2.wait(); // wait here until main thread has dropped the sandbox
+        assert!(interrupt_handle.dropped());
+    });
+
+    let res = sbox1
+        .call_guest_function_by_name::<i32>("Spin", ())
+        .unwrap_err();
+    assert!(matches!(res, HyperlightError::ExecutionCanceledByHost()));
+
+    barrier.wait();
+    // Make sure we can still call guest functions after the VM was interrupted
+    sbox1
+        .call_guest_function_by_name::<String>("Echo", "hello".to_string())
+        .unwrap();
+
+    // drop vm to make sure other thread can detect it
+    drop(sbox1);
+    barrier.wait();
+    thread.join().expect("Thread should finish");
+}
+
+/// Makes sure interrupting a vm before the guest call has started also prevents the guest call from being executed
+#[test]
+fn interrupt_guest_call_in_advance() {
+    let mut sbox1: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier2 = barrier.clone();
+    let interrupt_handle = sbox1.interrupt_handle();
+    assert!(!interrupt_handle.dropped()); // not yet dropped
+
+    // kill vm before the guest call has started
+    let thread = thread::spawn(move || {
+        assert!(!interrupt_handle.kill()); // should return false since vcpu is not running yet
+        barrier2.wait();
+        barrier2.wait(); // wait here until main thread has dropped the sandbox
+        assert!(interrupt_handle.dropped());
+    });
+
+    barrier.wait(); // wait until `kill()` is called before starting the guest call
+    let res = sbox1
+        .call_guest_function_by_name::<i32>("Spin", ())
+        .unwrap_err();
+    assert!(matches!(res, HyperlightError::ExecutionCanceledByHost()));
+
+    // Make sure we can still call guest functions after the VM was interrupted
+    sbox1
+        .call_guest_function_by_name::<String>("Echo", "hello".to_string())
+        .unwrap();
+
+    // drop vm to make sure other thread can detect it
+    drop(sbox1);
+    barrier.wait();
+    thread.join().expect("Thread should finish");
+}
+
+/// Verifies that only the intended sandbox (`sbox2`) is interruptible,
+/// even when multiple sandboxes share the same thread.
+/// This test runs several interleaved iterations where `sbox2` is interrupted,
+/// and ensures that:
+/// - `sbox1` and `sbox3` are never affected by the interrupt.
+/// - `sbox2` either completes normally or fails with `ExecutionCanceledByHost`.
+///
+/// This test is not foolproof and may not catch
+/// all possible interleavings, but can hopefully increases confidence somewhat.
+#[test]
+fn interrupt_same_thread() {
+    let mut sbox1: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox2: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox3: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier2 = barrier.clone();
+
+    let interrupt_handle = sbox2.interrupt_handle();
+    assert!(!interrupt_handle.dropped()); // not yet dropped
+
+    const NUM_ITERS: usize = 500;
+
+    // kill vm after 1 second
+    let thread = thread::spawn(move || {
+        for _ in 0..NUM_ITERS {
+            barrier2.wait();
+            interrupt_handle.kill();
+        }
+    });
+
+    for _ in 0..NUM_ITERS {
+        barrier.wait();
+        sbox1
+            .call_guest_function_by_name::<String>("Echo", "hello".to_string())
+            .expect("Only sandbox 2 is allowed to be interrupted");
+        match sbox2.call_guest_function_by_name::<String>("Echo", "hello".to_string()) {
+            Ok(_) | Err(HyperlightError::ExecutionCanceledByHost()) => {
+                // Only allow successful calls or interrupted.
+                // The call can be successful in case the call is finished before kill() is called.
+            }
+            _ => panic!("Unexpected return"),
+        };
+        sbox3
+            .call_guest_function_by_name::<String>("Echo", "hello".to_string())
+            .expect("Only sandbox 2 is allowed to be interrupted");
+    }
+    thread.join().expect("Thread should finish");
+}
+
+/// Same test as above but with no per-iteration barrier, to get more possible interleavings.
+#[test]
+fn interrupt_same_thread_no_barrier() {
+    let mut sbox1: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox2: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox3: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier2 = barrier.clone();
+    let workload_done = Arc::new(AtomicBool::new(false));
+    let workload_done2 = workload_done.clone();
+
+    let interrupt_handle = sbox2.interrupt_handle();
+    assert!(!interrupt_handle.dropped()); // not yet dropped
+
+    const NUM_ITERS: usize = 500;
+
+    // kill vm after 1 second
+    let thread = thread::spawn(move || {
+        barrier2.wait();
+        while !workload_done2.load(Ordering::Relaxed) {
+            interrupt_handle.kill();
+        }
+    });
+
+    barrier.wait();
+    for _ in 0..NUM_ITERS {
+        sbox1
+            .call_guest_function_by_name::<String>("Echo", "hello".to_string())
+            .expect("Only sandbox 2 is allowed to be interrupted");
+        match sbox2.call_guest_function_by_name::<String>("Echo", "hello".to_string()) {
+            Ok(_) | Err(HyperlightError::ExecutionCanceledByHost()) => {
+                // Only allow successful calls or interrupted.
+                // The call can be successful in case the call is finished before kill() is called.
+            }
+            _ => panic!("Unexpected return"),
+        };
+        sbox3
+            .call_guest_function_by_name::<String>("Echo", "hello".to_string())
+            .expect("Only sandbox 2 is allowed to be interrupted");
+    }
+    workload_done.store(true, Ordering::Relaxed);
+    thread.join().expect("Thread should finish");
+}
+
+// Verify that a sandbox moved to a different thread after initialization can still be killed,
+// and that anther sandbox on the original thread does not get incorrectly killed
+#[test]
+fn interrupt_moved_sandbox() {
+    let mut sbox1: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+    let mut sbox2: MultiUseSandbox = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
+
+    let interrupt_handle = sbox1.interrupt_handle();
+    let interrupt_handle2 = sbox2.interrupt_handle();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier2 = barrier.clone();
+
+    let thread = thread::spawn(move || {
+        barrier2.wait();
+        let res = sbox1
+            .call_guest_function_by_name::<i32>("Spin", ())
+            .unwrap_err();
+        assert!(matches!(res, HyperlightError::ExecutionCanceledByHost()));
+    });
+
+    let thread2 = thread::spawn(move || {
+        barrier.wait();
+        thread::sleep(Duration::from_secs(1));
+        assert!(interrupt_handle.kill());
+
+        // make sure this returns true, which means the sandbox wasn't killed incorrectly before
+        assert!(interrupt_handle2.kill());
+    });
+
+    let res = sbox2
+        .call_guest_function_by_name::<i32>("Spin", ())
+        .unwrap_err();
+    assert!(matches!(res, HyperlightError::ExecutionCanceledByHost()));
+
+    thread.join().expect("Thread should finish");
+    thread2.join().expect("Thread should finish");
+}
+
+/// This tests exercises the behavior of killing vcpu with a long retry delay.
+/// This will exercise the ABA-problem, where the vcpu could be successfully interrupted,
+/// but restarted, before the interruptor-thread has a chance to see that the vcpu was killed.
+///
+/// The ABA-problem is solved by introducing run-generation on the vcpu.
+#[test]
+#[cfg(target_os = "linux")]
+fn interrupt_custom_signal_no_and_retry_delay() {
+    let mut config = SandboxConfiguration::default();
+    config.set_interrupt_vcpu_sigrtmin_offset(0).unwrap();
+    config.set_interrupt_retry_delay(Duration::from_secs(1));
+
+    let mut sbox1: MultiUseSandbox = UninitializedSandbox::new(
+        GuestBinary::FilePath(simple_guest_as_string().unwrap()),
+        Some(config),
+    )
+    .unwrap()
+    .evolve(Noop::default())
+    .unwrap();
+
+    let interrupt_handle = sbox1.interrupt_handle();
+    assert!(!interrupt_handle.dropped()); // not yet dropped
+
+    const NUM_ITERS: usize = 3;
+
+    let thread = thread::spawn(move || {
+        for _ in 0..NUM_ITERS {
+            // wait for the guest call to start
+            thread::sleep(Duration::from_millis(1000));
+            interrupt_handle.kill();
+        }
+    });
+
+    for _ in 0..NUM_ITERS {
+        let res = sbox1
+            .call_guest_function_by_name::<i32>("Spin", ())
+            .unwrap_err();
+        assert!(matches!(res, HyperlightError::ExecutionCanceledByHost()));
+        // immediately reenter another guest function call after having being cancelled,
+        // so that the vcpu is running again before the interruptor-thread has a chance to see that the vcpu is not running
+    }
+    thread.join().expect("Thread should finish");
+}
+
+#[test]
+fn interrupt_spamming_host_call() {
+    let mut uninit = UninitializedSandbox::new(
+        GuestBinary::FilePath(callback_guest_as_string().unwrap()),
+        None,
+    )
+    .unwrap();
+
+    uninit
+        .register("HostFunc1", || {
+            // do nothing
+        })
+        .unwrap();
+    let mut sbox1: MultiUseSandbox = uninit.evolve(Noop::default()).unwrap();
+
+    let interrupt_handle = sbox1.interrupt_handle();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier2 = barrier.clone();
+
+    let thread = thread::spawn(move || {
+        barrier2.wait();
+        thread::sleep(Duration::from_secs(1));
+        interrupt_handle.kill();
+    });
+
+    barrier.wait();
+    // This guest call calls "HostFunc1" in a loop
+    let res = sbox1
+        .call_guest_function_by_name::<i32>("HostCallLoop", "HostFunc1".to_string())
+        .unwrap_err();
+
+    assert!(matches!(res, HyperlightError::ExecutionCanceledByHost()));
+
+    thread.join().expect("Thread should finish");
+}
 
 #[test]
 fn print_four_args_c_guest() {
@@ -35,18 +371,12 @@ fn print_four_args_c_guest() {
     let uninit = UninitializedSandbox::new(guest_path, None);
     let mut sbox1 = uninit.unwrap().evolve(Noop::default()).unwrap();
 
-    let res = sbox1.call_guest_function_by_name(
+    let res = sbox1.call_guest_function_by_name::<i32>(
         "PrintFourArgs",
-        ReturnType::String,
-        Some(vec![
-            ParameterValue::String("Test4".to_string()),
-            ParameterValue::Int(3_i32),
-            ParameterValue::Long(4_i64),
-            ParameterValue::String("Tested".to_string()),
-        ]),
+        ("Test4".to_string(), 3_i32, 4_i64, "Tested".to_string()),
     );
     println!("{:?}", res);
-    assert!(matches!(res, Ok(ReturnValue::Int(46))));
+    assert!(matches!(res, Ok(46)));
 }
 
 // Checks that guest can abort with a specific code.
@@ -55,11 +385,7 @@ fn guest_abort() {
     let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
     let error_code: u8 = 13; // this is arbitrary
     let res = sbox1
-        .call_guest_function_by_name(
-            "GuestAbortWithCode",
-            ReturnType::Void,
-            Some(vec![ParameterValue::Int(error_code as i32)]),
-        )
+        .call_guest_function_by_name::<()>("GuestAbortWithCode", error_code as i32)
         .unwrap_err();
     println!("{:?}", res);
     assert!(
@@ -72,14 +398,7 @@ fn guest_abort_with_context1() {
     let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1
-        .call_guest_function_by_name(
-            "GuestAbortWithMessage",
-            ReturnType::Void,
-            Some(vec![
-                ParameterValue::Int(25),
-                ParameterValue::String("Oh no".to_string()),
-            ]),
-        )
+        .call_guest_function_by_name::<()>("GuestAbortWithMessage", (25_i32, "Oh no".to_string()))
         .unwrap_err();
     println!("{:?}", res);
     assert!(
@@ -124,13 +443,9 @@ fn guest_abort_with_context2() {
                                 Proin sagittis nisl rhoncus mattis rhoncus urna. Magna eget est lorem ipsum.";
 
     let res = sbox1
-        .call_guest_function_by_name(
+        .call_guest_function_by_name::<()>(
             "GuestAbortWithMessage",
-            ReturnType::Void,
-            Some(vec![
-                ParameterValue::Int(60),
-                ParameterValue::String(abort_message.to_string()),
-            ]),
+            (60_i32, abort_message.to_string()),
         )
         .unwrap_err();
     println!("{:?}", res);
@@ -150,13 +465,9 @@ fn guest_abort_c_guest() {
     let mut sbox1 = uninit.unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1
-        .call_guest_function_by_name(
+        .call_guest_function_by_name::<()>(
             "GuestAbortWithMessage",
-            ReturnType::Void,
-            Some(vec![
-                ParameterValue::Int(75_i32),
-                ParameterValue::String("This is a test error message".to_string()),
-            ]),
+            (75_i32, "This is a test error message".to_string()),
         )
         .unwrap_err();
     println!("{:?}", res);
@@ -171,13 +482,7 @@ fn guest_panic() {
     let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
 
     let res = sbox1
-        .call_guest_function_by_name(
-            "guest_panic",
-            ReturnType::Void,
-            Some(vec![ParameterValue::String(
-                "Error... error...".to_string(),
-            )]),
-        )
+        .call_guest_function_by_name::<()>("guest_panic", "Error... error...".to_string())
         .unwrap_err();
     println!("{:?}", res);
     assert!(
@@ -190,32 +495,26 @@ fn guest_malloc() {
     // this test is rust-only
     let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
 
-    let size_to_allocate = 2000;
-    let res = sbox1
-        .call_guest_function_by_name(
-            "TestMalloc",
-            ReturnType::Int,
-            Some(vec![ParameterValue::Int(size_to_allocate)]),
-        )
+    let size_to_allocate = 2000_i32;
+    sbox1
+        .call_guest_function_by_name::<i32>("TestMalloc", size_to_allocate)
         .unwrap();
-    assert!(matches!(res, ReturnValue::Int(_)));
 }
 
 #[test]
 fn guest_allocate_vec() {
     let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
-    let size_to_allocate = 2000;
+    let size_to_allocate = 2000_i32;
 
     let res = sbox1
-        .call_guest_function_by_name(
+        .call_guest_function_by_name::<i32>(
             "CallMalloc", // uses the rust allocator to allocate a vector on heap
-            ReturnType::Int,
-            Some(vec![ParameterValue::Int(size_to_allocate)]),
+            size_to_allocate,
         )
         .unwrap();
 
-    assert!(matches!(res, ReturnValue::Int(returned_size) if returned_size == size_to_allocate));
+    assert_eq!(res, size_to_allocate);
 }
 
 // checks that malloc failures are captured correctly
@@ -223,14 +522,10 @@ fn guest_allocate_vec() {
 fn guest_malloc_abort() {
     let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
 
-    let size = 20000000; // some big number that should fail when allocated
+    let size = 20000000_i32; // some big number that should fail when allocated
 
     let res = sbox1
-        .call_guest_function_by_name(
-            "TestMalloc",
-            ReturnType::Int,
-            Some(vec![ParameterValue::Int(size)]),
-        )
+        .call_guest_function_by_name::<i32>("TestMalloc", size)
         .unwrap_err();
     println!("{:?}", res);
     assert!(
@@ -251,10 +546,9 @@ fn guest_malloc_abort() {
     .unwrap();
     let mut sbox2 = uninit.evolve(Noop::default()).unwrap();
 
-    let res = sbox2.call_guest_function_by_name(
+    let res = sbox2.call_guest_function_by_name::<i32>(
         "CallMalloc", // uses the rust allocator to allocate a vector on heap
-        ReturnType::Int,
-        Some(vec![ParameterValue::Int(size_to_allocate as i32)]),
+        size_to_allocate as i32,
     );
     println!("{:?}", res);
     assert!(matches!(
@@ -272,21 +566,13 @@ fn dynamic_stack_allocate_c_guest() {
     let uninit = UninitializedSandbox::new(guest_path, None);
     let mut sbox1: MultiUseSandbox = uninit.unwrap().evolve(Noop::default()).unwrap();
 
-    let res2 = sbox1
-        .call_guest_function_by_name(
-            "StackAllocate",
-            ReturnType::Int,
-            Some(vec![ParameterValue::Int(100)]),
-        )
+    let res: i32 = sbox1
+        .call_guest_function_by_name("StackAllocate", 100_i32)
         .unwrap();
-    assert!(matches!(res2, ReturnValue::Int(n) if n == 100));
+    assert_eq!(res, 100);
 
     let res = sbox1
-        .call_guest_function_by_name(
-            "StackAllocate",
-            ReturnType::Int,
-            Some(vec![ParameterValue::Int(128 * 1024 * 1024)]),
-        )
+        .call_guest_function_by_name::<i32>("StackAllocate", 0x800_0000_i32)
         .unwrap_err();
     assert!(matches!(res, HyperlightError::StackOverflow()));
 }
@@ -296,10 +582,8 @@ fn dynamic_stack_allocate_c_guest() {
 fn static_stack_allocate() {
     let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
-    let res = sbox1
-        .call_guest_function_by_name("SmallVar", ReturnType::Int, Some(Vec::new()))
-        .unwrap();
-    assert!(matches!(res, ReturnValue::Int(1024)));
+    let res: i32 = sbox1.call_guest_function_by_name("SmallVar", ()).unwrap();
+    assert_eq!(res, 1024);
 }
 
 // checks that a huge buffer on stack fails with stackoverflow
@@ -307,7 +591,7 @@ fn static_stack_allocate() {
 fn static_stack_allocate_overflow() {
     let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
     let res = sbox1
-        .call_guest_function_by_name("LargeVar", ReturnType::Int, Some(Vec::new()))
+        .call_guest_function_by_name::<i32>("LargeVar", ())
         .unwrap_err();
     assert!(matches!(res, HyperlightError::StackOverflow()));
 }
@@ -317,14 +601,10 @@ fn static_stack_allocate_overflow() {
 fn recursive_stack_allocate() {
     let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
-    let iterations = 1;
+    let iterations = 1_i32;
 
     sbox1
-        .call_guest_function_by_name(
-            "StackOverflow",
-            ReturnType::Int,
-            Some(vec![ParameterValue::Int(iterations)]),
-        )
+        .call_guest_function_by_name::<i32>("StackOverflow", iterations)
         .unwrap();
 }
 
@@ -350,11 +630,7 @@ fn guard_page_check() {
         // we have to create a sandbox each iteration because can't reuse after MMIO error in release mode
 
         let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
-        let result = sbox1.call_guest_function_by_name(
-            "test_write_raw_ptr",
-            ReturnType::String,
-            Some(vec![ParameterValue::Long(offset)]),
-        );
+        let result = sbox1.call_guest_function_by_name::<String>("test_write_raw_ptr", offset);
         if guard_range.contains(&offset) {
             // should have failed
             assert!(matches!(
@@ -373,7 +649,7 @@ fn guard_page_check_2() {
     let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
 
     let result = sbox1
-        .call_guest_function_by_name("InfiniteRecursion", ReturnType::Void, Some(vec![]))
+        .call_guest_function_by_name::<()>("InfiniteRecursion", ())
         .unwrap_err();
     assert!(matches!(result, HyperlightError::StackOverflow()));
 }
@@ -383,7 +659,7 @@ fn execute_on_stack() {
     let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
     let result = sbox1
-        .call_guest_function_by_name("ExecuteOnStack", ReturnType::String, Some(vec![]))
+        .call_guest_function_by_name::<String>("ExecuteOnStack", ())
         .unwrap_err();
 
     let err = result.to_string();
@@ -397,8 +673,7 @@ fn execute_on_stack() {
 #[ignore] // ran from Justfile because requires feature "executable_heap"
 fn execute_on_heap() {
     let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
-    let result =
-        sbox1.call_guest_function_by_name("ExecuteOnHeap", ReturnType::String, Some(vec![]));
+    let result = sbox1.call_guest_function_by_name::<String>("ExecuteOnHeap", ());
 
     println!("{:#?}", result);
     #[cfg(feature = "executable_heap")]
@@ -417,16 +692,12 @@ fn execute_on_heap() {
 fn memory_resets_after_failed_guestcall() {
     let mut sbox1 = new_uninit_rust().unwrap().evolve(Noop::default()).unwrap();
     sbox1
-        .call_guest_function_by_name("AddToStaticAndFail", ReturnType::String, None)
+        .call_guest_function_by_name::<String>("AddToStaticAndFail", ())
         .unwrap_err();
     let res = sbox1
-        .call_guest_function_by_name("GetStatic", ReturnType::Int, None)
+        .call_guest_function_by_name::<i32>("GetStatic", ())
         .unwrap();
-    assert!(
-        matches!(res, ReturnValue::Int(0)),
-        "Expected 0, got {:?}",
-        res
-    );
+    assert_eq!(res, 0, "Expected 0, got {:?}", res);
 }
 
 // checks that a recursive function with stack allocation eventually fails with stackoverflow
@@ -434,14 +705,10 @@ fn memory_resets_after_failed_guestcall() {
 fn recursive_stack_allocate_overflow() {
     let mut sbox1 = new_uninit().unwrap().evolve(Noop::default()).unwrap();
 
-    let iterations = 10;
+    let iterations = 10_i32;
 
     let res = sbox1
-        .call_guest_function_by_name(
-            "StackOverflow",
-            ReturnType::Void,
-            Some(vec![ParameterValue::Int(iterations)]),
-        )
+        .call_guest_function_by_name::<()>("StackOverflow", iterations)
         .unwrap_err();
     println!("{:?}", res);
     assert!(matches!(res, HyperlightError::StackOverflow()));
@@ -478,19 +745,23 @@ fn log_message() {
         assert_eq!(expected, LOGGER.num_log_calls());
 
         // Set the log level via env var
-        std::env::set_var("RUST_LOG", format!("hyperlight_guest={}", level));
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("RUST_LOG", format!("hyperlight_guest={}", level)) };
         log_test_messages(None);
         assert_eq!(expected, LOGGER.num_log_calls());
 
-        std::env::set_var("RUST_LOG", format!("hyperlight_host={}", level));
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("RUST_LOG", format!("hyperlight_host={}", level)) };
         log_test_messages(None);
         assert_eq!(expected, LOGGER.num_log_calls());
 
-        std::env::set_var("RUST_LOG", format!("{}", level));
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("RUST_LOG", format!("{}", level)) };
         log_test_messages(None);
         assert_eq!(expected, LOGGER.num_log_calls());
 
-        std::env::remove_var("RUST_LOG");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("RUST_LOG") };
     }
 
     // Test that if no log level is set, the default is error
@@ -511,14 +782,7 @@ fn log_test_messages(levelfilter: Option<log::LevelFilter>) {
 
         let message = format!("Hello from log_message level {}", level as i32);
         sbox1
-            .call_guest_function_by_name(
-                "LogMessage",
-                ReturnType::Void,
-                Some(vec![
-                    ParameterValue::String(message.to_string()),
-                    ParameterValue::Int(level as i32),
-                ]),
-            )
+            .call_guest_function_by_name::<()>("LogMessage", (message.to_string(), level as i32))
             .unwrap();
     }
 }

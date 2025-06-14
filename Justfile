@@ -12,6 +12,7 @@ default-target := "debug"
 simpleguest_source := "src/tests/rust_guests/simpleguest/target/x86_64-unknown-none"
 dummyguest_source := "src/tests/rust_guests/dummyguest/target/x86_64-unknown-none"
 callbackguest_source := "src/tests/rust_guests/callbackguest/target/x86_64-unknown-none"
+witguest_source := "src/tests/rust_guests/witguest/target/x86_64-unknown-none"
 rust_guests_bin_dir := "src/tests/rust_guests/bin"
 
 ################
@@ -23,20 +24,31 @@ alias cg := build-and-move-c-guests
 
 # build host library
 build target=default-target:
-    cargo build --profile={{ if target == "debug" { "dev" } else { target } }}
+    cargo build --profile={{ if target == "debug" { "dev" } else { target } }} 
+
+# build host library
+build-with-musl-libc target=default-target:
+    cargo build --profile={{ if target == "debug" { "dev" } else { target } }} --target x86_64-unknown-linux-musl
+
 
 # build testing guest binaries
 guests: build-and-move-rust-guests build-and-move-c-guests
 
-build-rust-guests target=default-target:
+witguest-wit:
+    cargo install --locked wasm-tools
+    cd src/tests/rust_guests/witguest && wasm-tools component wit guest.wit -w -o interface.wasm
+
+build-rust-guests target=default-target: (witguest-wit)
     cd src/tests/rust_guests/callbackguest && cargo build --profile={{ if target == "debug" { "dev" } else { target } }}
     cd src/tests/rust_guests/simpleguest && cargo build --profile={{ if target == "debug" { "dev" } else { target } }} 
     cd src/tests/rust_guests/dummyguest && cargo build --profile={{ if target == "debug" { "dev" } else { target } }} 
+    cd src/tests/rust_guests/witguest && cargo build --profile={{ if target == "debug" { "dev" } else { target } }}
 
 @move-rust-guests target=default-target:
     cp {{ callbackguest_source }}/{{ target }}/callbackguest* {{ rust_guests_bin_dir }}/{{ target }}/
     cp {{ simpleguest_source }}/{{ target }}/simpleguest* {{ rust_guests_bin_dir }}/{{ target }}/
     cp {{ dummyguest_source }}/{{ target }}/dummyguest* {{ rust_guests_bin_dir }}/{{ target }}/
+    cp {{ witguest_source }}/{{ target }}/witguest* {{ rust_guests_bin_dir }}/{{ target }}/
 
 build-and-move-rust-guests: (build-rust-guests "debug") (move-rust-guests "debug") (build-rust-guests "release") (move-rust-guests "release")
 build-and-move-c-guests: (build-c-guests "debug") (move-c-guests "debug") (build-c-guests "release") (move-c-guests "release")
@@ -48,6 +60,8 @@ clean-rust:
     cd src/tests/rust_guests/simpleguest && cargo clean
     cd src/tests/rust_guests/dummyguest && cargo clean
     cd src/tests/rust_guests/callbackguest && cargo clean
+    cd src/tests/rust_guests/witguest && cargo clean
+    cd src/tests/rust_guests/witguest && rm -f interface.wasm
     git clean -fdx src/tests/c_guests/bin src/tests/rust_guests/bin
 
 ################
@@ -72,6 +86,9 @@ test-like-ci config=default-target hypervisor="kvm":
     @# without any driver (should fail to compile)
     just test-compilation-fail {{config}}
 
+    @# test the crashdump feature
+    just test-rust-crashdump {{config}}
+
 # runs all tests
 test target=default-target features="": (test-unit target features) (test-isolated target features) (test-integration "rust" target features) (test-integration "c" target features) (test-seccomp target features)
 
@@ -83,14 +100,12 @@ test-unit target=default-target features="":
 test-isolated target=default-target features="":
     cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F " + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --lib -- sandbox::uninitialized::tests::test_trace_trace --exact --ignored
     cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F " + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --lib -- sandbox::uninitialized::tests::test_log_trace --exact --ignored
-    cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F " + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --lib -- hypervisor::hypervisor_handler::tests::create_1000_sandboxes --exact --ignored
+    cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F " + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --lib -- sandbox::initialized_multi_use::tests::create_1000_sandboxes --exact --ignored
     cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F " + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --lib -- sandbox::outb::tests::test_log_outb_log --exact --ignored
     cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F " + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --lib -- mem::shared_mem::tests::test_drop --exact --ignored
     cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F " + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --test integration_test -- log_message --exact --ignored
     @# metrics tests
-    cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F " + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --lib -- metrics::tests::test_metrics_are_emitted --exact --ignored
-    cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F function_call_metrics," + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --lib -- metrics::tests::test_metrics_are_emitted --exact --ignored
-    
+    cargo test {{ if features =="" {''} else if features=="no-default-features" {"--no-default-features" } else {"--no-default-features -F function_call_metrics," + features } }} --profile={{ if target == "debug" { "dev" } else { target } }} -p hyperlight-host --lib -- metrics::tests::test_metrics_are_emitted --exact 
 # runs integration tests. Guest can either be "rust" or "c"
 test-integration guest target=default-target features="":
     @# run execute_on_heap test with feature "executable_heap" on and off
@@ -116,6 +131,10 @@ test-rust-gdb-debugging target=default-target features="":
     cargo test --profile={{ if target == "debug" { "dev" } else { target } }} --example guest-debugging {{ if features =="" {'--features gdb'} else { "--features gdb," + features } }}
     cargo test --profile={{ if target == "debug" { "dev" } else { target } }} {{ if features =="" {'--features gdb'} else { "--features gdb," + features } }} -- test_gdb
 
+# rust test for crashdump
+test-rust-crashdump target=default-target features="":
+    cargo test --profile={{ if target == "debug" { "dev" } else { target } }} {{ if features =="" {'--features crashdump'} else { "--features crashdump," + features } }} -- test_crashdump
+
 
 ################
 ### LINTING ####
@@ -129,21 +148,27 @@ fmt-check:
     cargo +nightly fmt --manifest-path src/tests/rust_guests/callbackguest/Cargo.toml -- --check
     cargo +nightly fmt --manifest-path src/tests/rust_guests/simpleguest/Cargo.toml -- --check
     cargo +nightly fmt --manifest-path src/tests/rust_guests/dummyguest/Cargo.toml -- --check
+    cargo +nightly fmt --manifest-path src/tests/rust_guests/witguest/Cargo.toml -- --check
     cargo +nightly fmt --manifest-path src/hyperlight_guest_capi/Cargo.toml -- --check
+
+check-license-headers:
+    ./dev/check-license-headers.sh
 
 fmt-apply:
     cargo +nightly fmt --all
     cargo +nightly fmt --manifest-path src/tests/rust_guests/callbackguest/Cargo.toml
     cargo +nightly fmt --manifest-path src/tests/rust_guests/simpleguest/Cargo.toml
     cargo +nightly fmt --manifest-path src/tests/rust_guests/dummyguest/Cargo.toml
+    cargo +nightly fmt --manifest-path src/tests/rust_guests/witguest/Cargo.toml
     cargo +nightly fmt --manifest-path src/hyperlight_guest_capi/Cargo.toml
 
-clippy target=default-target:
+clippy target=default-target: (witguest-wit)
     cargo clippy --all-targets --all-features --profile={{ if target == "debug" { "dev" } else { target } }} -- -D warnings
 
-clippy-guests target=default-target:
+clippy-guests target=default-target: (witguest-wit)
     cd src/tests/rust_guests/simpleguest && cargo clippy --profile={{ if target == "debug" { "dev" } else { target } }} -- -D warnings
     cd src/tests/rust_guests/callbackguest && cargo clippy --profile={{ if target == "debug" { "dev" } else { target } }} -- -D warnings
+    cd src/tests/rust_guests/witguest && cargo clippy --profile={{ if target == "debug" { "dev" } else { target } }} -- -D warnings
 
 clippy-apply-fix-unix:
     cargo clippy --fix --all 
@@ -153,7 +178,7 @@ clippy-apply-fix-windows:
 
 # Verify Minimum Supported Rust Version
 verify-msrv:
-    ./dev/verify-msrv.sh hyperlight-host hyperlight-guest hyperlight-common
+    ./dev/verify-msrv.sh hyperlight-host hyperlight-guest hyperlight-guest-lib hyperlight-common
 
 #####################
 ### RUST EXAMPLES ###
@@ -175,7 +200,7 @@ run-rust-examples-linux target=default-target features="": (run-rust-examples ta
 #########################
 
 tar-headers: (build-rust-capi) # build-rust-capi is a dependency because we need the hyperlight_guest.h to be built
-    tar -zcvf include.tar.gz -C {{root}}/src/hyperlight_guest/third_party/ musl/include musl/arch/x86_64 printf/printf.h -C {{root}}/src/hyperlight_guest_capi include
+    tar -zcvf include.tar.gz -C {{root}}/src/hyperlight_guest_bin/third_party/ musl/include musl/arch/x86_64 printf/printf.h -C {{root}}/src/hyperlight_guest_capi include
 
 tar-static-lib: (build-rust-capi "release") (build-rust-capi "debug")
     tar -zcvf hyperlight-guest-c-api-linux.tar.gz -C {{root}}/target/x86_64-unknown-none/ release/libhyperlight_guest_capi.a -C {{root}}/target/x86_64-unknown-none/ debug/libhyperlight_guest_capi.a

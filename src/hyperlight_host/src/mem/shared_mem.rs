@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,24 +22,24 @@ use std::ptr::null_mut;
 use std::sync::{Arc, RwLock};
 
 use hyperlight_common::mem::PAGE_SIZE_USIZE;
-use tracing::{instrument, Span};
-#[cfg(target_os = "windows")]
-use windows::core::PCSTR;
+use tracing::{Span, instrument};
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Memory::PAGE_READWRITE;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Memory::{
-    CreateFileMappingA, MapViewOfFile, UnmapViewOfFile, VirtualProtect, FILE_MAP_ALL_ACCESS,
-    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
+    CreateFileMappingA, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, UnmapViewOfFile, VirtualProtect,
 };
+#[cfg(target_os = "windows")]
+use windows::core::PCSTR;
 
 #[cfg(target_os = "windows")]
 use crate::HyperlightError::MemoryAllocationFailed;
 #[cfg(target_os = "windows")]
 use crate::HyperlightError::{MemoryRequestTooBig, WindowsAPIError};
-use crate::{log_then_return, new_error, Result};
+use crate::{Result, log_then_return, new_error};
 
 /// Makes sure that the given `offset` and `size` are within the bounds of the memory with size `mem_size`.
 macro_rules! bounds_check {
@@ -136,7 +136,7 @@ pub struct ExclusiveSharedMemory {
 }
 unsafe impl Send for ExclusiveSharedMemory {}
 
-/// A GuestSharedMemory is used by the hypervisor handler to represent
+/// A GuestSharedMemory is used to represent
 /// the reference to all-of-memory that is taken by the virtual cpu.
 /// Because of the memory model limitations that affect
 /// HostSharedMemory, it is likely fairly important (to ensure that
@@ -311,8 +311,8 @@ impl ExclusiveSharedMemory {
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
     pub fn new(min_size_bytes: usize) -> Result<Self> {
         use libc::{
-            c_int, mmap, mprotect, off_t, size_t, MAP_ANONYMOUS, MAP_FAILED, MAP_NORESERVE,
-            MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE,
+            MAP_ANONYMOUS, MAP_FAILED, MAP_NORESERVE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE,
+            c_int, mmap, mprotect, off_t, size_t,
         };
 
         use crate::error::HyperlightError::{MemoryRequestTooBig, MmapFailed, MprotectFailed};
@@ -521,7 +521,7 @@ impl ExclusiveSharedMemory {
         // make the memory executable on Linux
         #[cfg(target_os = "linux")]
         {
-            use libc::{mprotect, PROT_EXEC, PROT_READ, PROT_WRITE};
+            use libc::{PROT_EXEC, PROT_READ, PROT_WRITE, mprotect};
 
             let res = unsafe {
                 mprotect(
@@ -1007,8 +1007,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{ExclusiveSharedMemory, HostSharedMemory, SharedMemory};
-    use crate::mem::shared_mem_tests::read_write_test_suite;
     use crate::Result;
+    use crate::mem::shared_mem_tests::read_write_test_suite;
 
     #[test]
     fn fill() {

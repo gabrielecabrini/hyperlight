@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,4 +21,8 @@ pub mod guest_error;
 pub mod guest_log_data;
 /// cbindgen:ignore
 pub mod guest_log_level;
+/// cbindgen:ignore
+pub mod host_function_definition;
+/// cbindgen:ignore
+pub mod host_function_details;
 pub mod util;

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@ limitations under the License.
 */
 
 use hyperlight_common::flatbuffer_wrappers::function_types::{ReturnType, ReturnValue};
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 
 use crate::HyperlightError::ReturnValueConversionFailure;
-use crate::{log_then_return, Result};
+use crate::{Result, log_then_return};
 
 /// This is a marker trait that is used to indicate that a type is a valid Hyperlight return type.
 pub trait SupportedReturnType: Sized + Clone + Send + Sync + 'static {
@@ -49,6 +49,8 @@ macro_rules! for_each_return_type {
         $macro!(u32, UInt);
         $macro!(i64, Long);
         $macro!(u64, ULong);
+        $macro!(f32, Float);
+        $macro!(f64, Double);
         $macro!(bool, Bool);
         $macro!(Vec<u8>, VecBytes);
     };

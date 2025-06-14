@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,10 +16,9 @@ limitations under the License.
 #![allow(clippy::disallowed_macros)]
 use std::thread;
 
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnType};
+use hyperlight_host::sandbox::SandboxConfiguration;
 #[cfg(gdb)]
 use hyperlight_host::sandbox::config::DebugInfo;
-use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::sandbox_state::sandbox::EvolvableSandbox;
 use hyperlight_host::sandbox_state::transition::Noop;
 use hyperlight_host::{MultiUseSandbox, UninitializedSandbox};
@@ -62,13 +61,12 @@ fn main() -> hyperlight_host::Result<()> {
 
     // Call guest function
     let message = "Hello, World! I am executing inside of a VM :)\n".to_string();
-    let result = multi_use_sandbox.call_guest_function_by_name(
-        "PrintOutput", // function must be defined in the guest binary
-        ReturnType::Int,
-        Some(vec![ParameterValue::String(message.clone())]),
-    );
-
-    assert!(result.is_ok());
+    multi_use_sandbox
+        .call_guest_function_by_name::<i32>(
+            "PrintOutput", // function must be defined in the guest binary
+            message.clone(),
+        )
+        .unwrap();
 
     Ok(())
 }
@@ -81,7 +79,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    use hyperlight_host::{new_error, Result};
+    use hyperlight_host::{Result, new_error};
     use io::{BufReader, BufWriter, Read, Write};
 
     use super::*;

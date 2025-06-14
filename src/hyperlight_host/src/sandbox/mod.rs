@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ limitations under the License.
 /// Configuration needed to establish a sandbox.
 pub mod config;
 /// Functionality for reading, but not modifying host functions
-mod host_funcs;
+pub(crate) mod host_funcs;
 /// Functionality for dealing with `Sandbox`es that contain Hypervisors
 pub(crate) mod hypervisor;
 /// Functionality for dealing with initialized sandboxes that can
@@ -37,18 +37,22 @@ pub mod uninitialized;
 /// initialized `Sandbox`es.
 pub(crate) mod uninitialized_evolve;
 
+/// Trait used by the macros to paper over the differences between hyperlight and hyperlight-wasm
+mod callable;
+
+/// Trait used by the macros to paper over the differences between hyperlight and hyperlight-wasm
+pub use callable::Callable;
 /// Re-export for `SandboxConfiguration` type
 pub use config::SandboxConfiguration;
 /// Re-export for the `MultiUseSandbox` type
 pub use initialized_multi_use::MultiUseSandbox;
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 /// Re-export for `GuestBinary` type
 pub use uninitialized::GuestBinary;
 /// Re-export for `UninitializedSandbox` type
 pub use uninitialized::UninitializedSandbox;
 
 use self::mem_mgr::MemMgrWrapper;
-use crate::hypervisor::hypervisor_handler::HypervisorHandler;
 #[cfg(target_os = "windows")]
 use crate::hypervisor::windows_hypervisor_platform;
 use crate::mem::shared_mem::HostSharedMemory;
@@ -86,9 +90,6 @@ pub(crate) trait WrapperGetter {
     #[allow(dead_code)]
     fn get_mgr_wrapper(&self) -> &MemMgrWrapper<HostSharedMemory>;
     fn get_mgr_wrapper_mut(&mut self) -> &mut MemMgrWrapper<HostSharedMemory>;
-    fn get_hv_handler(&self) -> &HypervisorHandler;
-    #[allow(dead_code)]
-    fn get_hv_handler_mut(&mut self) -> &mut HypervisorHandler;
 }
 
 #[cfg(test)]
@@ -102,7 +103,7 @@ mod tests {
     use crate::sandbox::uninitialized::GuestBinary;
     use crate::sandbox_state::sandbox::EvolvableSandbox;
     use crate::sandbox_state::transition::Noop;
-    use crate::{new_error, MultiUseSandbox, UninitializedSandbox};
+    use crate::{MultiUseSandbox, UninitializedSandbox, new_error};
 
     #[test]
     // TODO: add support for testing on WHP

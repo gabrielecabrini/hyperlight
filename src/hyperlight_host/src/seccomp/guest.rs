@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@ limitations under the License.
 use seccompiler::SeccompCmpOp::Eq;
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen as ArgLen, SeccompCondition as Cond, SeccompFilter,
-    SeccompRule,
+    SeccompRule, TargetArch,
 };
 
 use crate::sandbox::ExtraAllowedSyscall;
-use crate::{and, or, Result};
+use crate::{Result, and, or};
 
 fn syscalls_allowlist() -> Result<Vec<(i64, Vec<SeccompRule>)>> {
     Ok(vec![
@@ -49,7 +49,25 @@ fn syscalls_allowlist() -> Result<Vec<(i64, Vec<SeccompRule>)>> {
         // because we don't currently support registering parameterized syscalls.
         (
             libc::SYS_ioctl,
-            or![and![Cond::new(1, ArgLen::Dword, Eq, libc::TCGETS)?]],
+            or![and![Cond::new(
+                1,
+                ArgLen::Dword,
+                Eq,
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_vendor = "unknown",
+                    target_os = "linux",
+                    target_env = "musl"
+                ))]
+                libc::TCGETS.try_into()?,
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_vendor = "unknown",
+                    target_os = "linux",
+                    target_env = "musl"
+                )))]
+                libc::TCGETS,
+            )?]],
         ),
         // `futex` is needed for some tests that run in parallel (`simple_test_parallel`,
         // and `callback_test_parallel`).
@@ -57,12 +75,17 @@ fn syscalls_allowlist() -> Result<Vec<(i64, Vec<SeccompRule>)>> {
         // `sched_yield` is needed for many synchronization primitives that may be invoked
         // on the host function worker thread
         (libc::SYS_sched_yield, vec![]),
+        // `mprotect` is needed by malloc during memory allocation
+        (libc::SYS_mprotect, vec![]),
+        // `openat` is marked allowed here because it may be called by `libc::free()`
+        // since it will try to open /proc/sys/vm/overcommit_memory (https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/unix/sysv/linux/malloc-sysdep.h;h=778d8971d53e284397c3a5dcdd923e93be5e4731;hb=HEAD)
+        // We have another more restrictive filter for it below so it will return EACCES instead of trap, in which case libc will use the default value
+        (libc::SYS_openat, vec![]),
     ])
 }
 
-/// Creates a `BpfProgram` for a `SeccompFilter` over specific syscalls/`SeccompRule`s
-/// intended to be applied in the Hypervisor Handler thread - i.e., over untrusted guest code
-/// execution.
+/// Creates two `BpfProgram`s for a `SeccompFilter` over specific syscalls/`SeccompRule`s
+/// intended to be applied on host function threads.
 ///
 /// Note: This does not provide coverage over the Hyperlight host, which is why we don't need
 /// `SeccompRules` for operations we definitely perform but are outside the handler thread
@@ -70,7 +93,7 @@ fn syscalls_allowlist() -> Result<Vec<(i64, Vec<SeccompRule>)>> {
 /// or `KVM_CREATE_VCPU`).
 pub(crate) fn get_seccomp_filter_for_host_function_worker_thread(
     extra_allowed_syscalls: Option<&[ExtraAllowedSyscall]>,
-) -> Result<BpfProgram> {
+) -> Result<Vec<BpfProgram>> {
     let mut allowed_syscalls = syscalls_allowlist()?;
 
     if let Some(extra_allowed_syscalls) = extra_allowed_syscalls {
@@ -86,11 +109,50 @@ pub(crate) fn get_seccomp_filter_for_host_function_worker_thread(
         allowed_syscalls.dedup();
     }
 
-    Ok(SeccompFilter::new(
+    let arch: TargetArch = std::env::consts::ARCH.try_into()?;
+
+    // Allowlist filter that traps on unknown syscalls
+    let allowlist = SeccompFilter::new(
         allowed_syscalls.into_iter().collect(),
-        SeccompAction::Trap,  // non-match syscall will kill the offending thread
-        SeccompAction::Allow, // match syscall will be allowed
-        std::env::consts::ARCH.try_into()?,
-    )
-    .and_then(|filter| filter.try_into())?)
+        SeccompAction::Trap,
+        SeccompAction::Allow,
+        arch,
+    )?
+    .try_into()?;
+
+    // If `openat` is an exclicitly allowed syscall, we shouldn't return the filter that forces it to return EACCES.
+    if let Some(extra_syscalls) = extra_allowed_syscalls {
+        if extra_syscalls.contains(&libc::SYS_openat) {
+            return Ok(vec![allowlist]);
+        }
+    }
+    // Otherwise, we return both filters.
+
+    // Filter that forces `openat` to return EACCES
+    let errno_on_openat = SeccompFilter::new(
+        [(libc::SYS_openat, vec![])].into_iter().collect(),
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EACCES.try_into()?),
+        arch,
+    )?
+    .try_into()?;
+
+    // Note: the order of the 2 filters are important. If we applied the strict filter first,
+    // we wouldn't be allowed to setup the second filter (would be trapped since the syscalls to setup seccomp are not allowed).
+    // However, from an seccomp filter perspective, the order of the filters is not important:
+    //
+    //    If multiple filters exist, they are all executed, in reverse order
+    //    of their addition to the filter tree—that is, the most recently
+    //    installed filter is executed first.  (Note that all filters will
+    //    be called even if one of the earlier filters returns
+    //    SECCOMP_RET_KILL.  This is done to simplify the kernel code and to
+    //    provide a tiny speed-up in the execution of sets of filters by
+    //    avoiding a check for this uncommon case.)  The return value for
+    //    the evaluation of a given system call is the first-seen action
+    //    value of highest precedence (along with its accompanying data)
+    //    returned by execution of all of the filters.
+    //
+    //  (https://man7.org/linux/man-pages/man2/seccomp.2.html).
+    //
+    Ok(vec![errno_on_openat, allowlist])
 }

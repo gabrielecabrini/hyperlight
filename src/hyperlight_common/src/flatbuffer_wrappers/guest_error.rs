@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use anyhow::{Error, Result};
 use flatbuffers::size_prefixed_root;
 #[cfg(feature = "tracing")]
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 
 use crate::flatbuffers::hyperlight::generated::{
     ErrorCode as FbErrorCode, GuestError as FbGuestError, GuestErrorArgs,

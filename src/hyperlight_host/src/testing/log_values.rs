@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 use serde_json::{Map, Value};
 
-use crate::{new_error, Result};
+use crate::{Result, new_error};
 
 /// Call `check_value_as_str` and panic if it returned an `Err`. Otherwise,
 /// do nothing.

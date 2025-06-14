@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,23 +18,25 @@ use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 
 use hyperlight_common::flatbuffer_wrappers::function_call::{
-    validate_guest_function_call_buffer, FunctionCall,
+    FunctionCall, validate_guest_function_call_buffer,
 };
 use hyperlight_common::flatbuffer_wrappers::function_types::ReturnValue;
 use hyperlight_common::flatbuffer_wrappers::guest_error::GuestError;
 use hyperlight_common::flatbuffer_wrappers::guest_log_data::GuestLogData;
-use tracing::{instrument, Span};
+use hyperlight_common::flatbuffer_wrappers::host_function_details::HostFunctionDetails;
+use tracing::{Span, instrument};
 
 use super::exe::ExeInfo;
 use super::layout::SandboxMemoryLayout;
-use super::memory_region::{MemoryRegion, MemoryRegionType};
+use super::memory_region::{DEFAULT_GUEST_BLOB_MEM_FLAGS, MemoryRegion, MemoryRegionType};
 use super::ptr::{GuestPtr, RawPtr};
 use super::ptr_offset::Offset;
 use super::shared_mem::{ExclusiveSharedMemory, GuestSharedMemory, HostSharedMemory, SharedMemory};
 use super::shared_mem_snapshot::SharedMemorySnapshot;
 use crate::error::HyperlightError::NoMemorySnapshot;
 use crate::sandbox::SandboxConfiguration;
-use crate::{log_then_return, new_error, HyperlightError, Result};
+use crate::sandbox::uninitialized::GuestBlob;
+use crate::{HyperlightError, Result, log_then_return, new_error};
 
 /// Paging Flags
 ///
@@ -42,10 +44,10 @@ use crate::{log_then_return, new_error, HyperlightError, Result};
 ///
 /// * Very basic description: https://stackoverflow.com/a/26945892
 /// * More in-depth descriptions: https://wiki.osdev.org/Paging
-const PAGE_PRESENT: u64 = 1; // Page is Present
-const PAGE_RW: u64 = 1 << 1; // Page is Read/Write (if not set page is read only so long as the WP bit in CR0 is set to 1 - which it is in Hyperlight)
-const PAGE_USER: u64 = 1 << 2; // User/Supervisor (if this bit is set then the page is accessible by user mode code)
-const PAGE_NX: u64 = 1 << 63; // Execute Disable (if this bit is set then data in the page cannot be executed)
+pub(crate) const PAGE_PRESENT: u64 = 1; // Page is Present
+pub(crate) const PAGE_RW: u64 = 1 << 1; // Page is Read/Write (if not set page is read only so long as the WP bit in CR0 is set to 1 - which it is in Hyperlight)
+pub(crate) const PAGE_USER: u64 = 1 << 2; // User/Supervisor (if this bit is set then the page is accessible by user mode code)
+pub(crate) const PAGE_NX: u64 = 1 << 63; // Execute Disable (if this bit is set then data in the page cannot be executed)
 
 // The amount of memory that can be mapped per page table
 pub(super) const AMOUNT_OF_MEMORY_PER_PT: usize = 0x200_000;
@@ -145,8 +147,7 @@ where
 
             let mem_size = usize::try_from(mem_size)?;
 
-            let num_pages: usize =
-                (mem_size + AMOUNT_OF_MEMORY_PER_PT - 1) / AMOUNT_OF_MEMORY_PER_PT;
+            let num_pages: usize = mem_size.div_ceil(AMOUNT_OF_MEMORY_PER_PT);
 
             // Create num_pages PT with 512 PTEs
             for p in 0..num_pages {
@@ -158,6 +159,11 @@ where
                             // TODO: We parse and load the exe according to its sections and then
                             // have the correct flags set rather than just marking the entire binary as executable
                             MemoryRegionType::Code => PAGE_PRESENT | PAGE_RW | PAGE_USER,
+                            MemoryRegionType::InitData => self
+                                .layout
+                                .init_data_permissions
+                                .map(|perm| perm.translate_flags())
+                                .unwrap_or(DEFAULT_GUEST_BLOB_MEM_FLAGS.translate_flags()),
                             MemoryRegionType::Stack => PAGE_PRESENT | PAGE_RW | PAGE_USER | PAGE_NX,
                             #[cfg(feature = "executable_heap")]
                             MemoryRegionType::Heap => PAGE_PRESENT | PAGE_RW | PAGE_USER,
@@ -171,6 +177,8 @@ where
                             MemoryRegionType::InputData => PAGE_PRESENT | PAGE_RW | PAGE_NX,
                             MemoryRegionType::OutputData => PAGE_PRESENT | PAGE_RW | PAGE_NX,
                             MemoryRegionType::Peb => PAGE_PRESENT | PAGE_RW | PAGE_NX,
+                            // Host Function Definitions are readonly in the guest
+                            MemoryRegionType::HostFunctionDefinitions => PAGE_PRESENT | PAGE_NX,
                             MemoryRegionType::PageTables => PAGE_PRESENT | PAGE_RW | PAGE_NX,
                         },
                         // If there is an error then the address isn't mapped so mark it as not present
@@ -284,12 +292,18 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
     pub(crate) fn load_guest_binary_into_memory(
         cfg: SandboxConfiguration,
         exe_info: &mut ExeInfo,
+        guest_blob: Option<&GuestBlob>,
     ) -> Result<Self> {
+        let guest_blob_size = guest_blob.map(|b| b.data.len()).unwrap_or(0);
+        let guest_blob_mem_flags = guest_blob.map(|b| b.permissions);
+
         let layout = SandboxMemoryLayout::new(
             cfg,
             exe_info.loaded_size(),
             usize::try_from(cfg.get_stack_size(exe_info))?,
             usize::try_from(cfg.get_heap_size(exe_info))?,
+            guest_blob_size,
+            guest_blob_mem_flags,
         )?;
         let mut shared_mem = ExclusiveSharedMemory::new(layout.get_memory_size()?)?;
 
@@ -311,6 +325,42 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
         )?;
 
         Ok(Self::new(layout, shared_mem, load_addr, entrypoint_offset))
+    }
+
+    /// Writes host function details to memory
+    #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
+    pub(crate) fn write_buffer_host_function_details(&mut self, buffer: &[u8]) -> Result<()> {
+        let host_function_details = HostFunctionDetails::try_from(buffer).map_err(|e| {
+            new_error!(
+                "write_buffer_host_function_details: failed to convert buffer to HostFunctionDetails: {}",
+                e
+            )
+        })?;
+
+        let host_function_call_buffer: Vec<u8> = (&host_function_details).try_into().map_err(|_| {
+            new_error!(
+                "write_buffer_host_function_details: failed to convert HostFunctionDetails to Vec<u8>"
+            )
+        })?;
+
+        let buffer_size = {
+            let size_u64 = self
+                .shared_mem
+                .read_u64(self.layout.get_host_function_definitions_size_offset())?;
+            usize::try_from(size_u64)
+        }?;
+
+        if host_function_call_buffer.len() > buffer_size {
+            log_then_return!(
+                "Host Function Details buffer is too big for the host_function_definitions buffer"
+            );
+        }
+
+        self.shared_mem.copy_from_slice(
+            host_function_call_buffer.as_slice(),
+            self.layout.host_function_definitions_buffer_offset,
+        )?;
+        Ok(())
     }
 
     /// Set the stack guard to `cookie` using `layout` to calculate

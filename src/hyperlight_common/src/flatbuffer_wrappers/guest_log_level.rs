@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,16 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use anyhow::{bail, Error, Result};
+use anyhow::{Error, Result, bail};
 use log::Level;
-use strum::EnumIter;
 #[cfg(feature = "tracing")]
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 
 use crate::flatbuffers::hyperlight::generated::LogLevel as FbLogLevel;
 
 #[repr(u8)]
-#[derive(Copy, Clone, Eq, PartialEq, Debug, EnumIter)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum LogLevel {
     Trace = 0,
     Debug = 1,

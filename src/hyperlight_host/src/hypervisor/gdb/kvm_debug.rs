@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,14 +17,14 @@ limitations under the License.
 use std::collections::HashMap;
 
 use kvm_bindings::{
-    kvm_debug_exit_arch, kvm_guest_debug, kvm_regs, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP,
-    KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP,
+    KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_HW_BP, KVM_GUESTDBG_USE_SW_BP,
+    kvm_debug_exit_arch, kvm_guest_debug, kvm_regs,
 };
 use kvm_ioctls::VcpuFd;
 
-use super::arch::{vcpu_stop_reason, MAX_NO_OF_HW_BP, SW_BP_SIZE};
+use super::arch::{MAX_NO_OF_HW_BP, SW_BP_SIZE, vcpu_stop_reason};
 use super::{GuestDebug, VcpuStopReason, X86_64Regs};
-use crate::{new_error, HyperlightError, Result};
+use crate::{HyperlightError, Result, new_error};
 
 /// KVM Debug struct
 /// This struct is used to abstract the internal details of the kvm

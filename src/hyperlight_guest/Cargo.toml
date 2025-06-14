@@ -1,6 +1,5 @@
 [package]
 name = "hyperlight-guest"
-links = "c"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,23 +8,10 @@ homepage.workspace = true
 repository.workspace = true
 readme.workspace = true
 description = """
-Library to build guest applications for hyperlight.
+Provides only the essential building blocks for interacting with the host environment, including the VM exit mechanism, abstractions for calling host functions and receiving return values, and the input/output stacks used for guest-host communication.
 """
-
-[features]
-default = ["libc", "printf"]
-libc = [] # compile musl libc
-printf = [] # compile printf
 
 [dependencies]
 anyhow = { version = "1.0.98", default-features = false }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
-buddy_system_allocator = "0.11.0"
 hyperlight-common = { workspace = true }
-spin = "0.10.0"
-log = { version = "0.4", default-features = false }
-
-[build-dependencies]
-cc = "1.2"
-cfg-if = "1.0"
-glob = "0.3.2"

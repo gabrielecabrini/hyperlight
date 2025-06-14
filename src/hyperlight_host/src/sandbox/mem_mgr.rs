@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 
+use crate::Result;
 use crate::mem::layout::SandboxMemoryLayout;
-use crate::mem::mgr::{SandboxMemoryManager, STACK_COOKIE_LEN};
+use crate::mem::mgr::{STACK_COOKIE_LEN, SandboxMemoryManager};
 use crate::mem::shared_mem::{
     ExclusiveSharedMemory, GuestSharedMemory, HostSharedMemory, SharedMemory,
 };
-use crate::Result;
 
 /// StackCookie
 pub type StackCookie = [u8; STACK_COOKIE_LEN];
@@ -97,6 +97,15 @@ impl MemMgrWrapper<ExclusiveSharedMemory> {
         let shared_mem = mgr.get_shared_mem_mut();
         let mem_size = shared_mem.mem_size();
         layout.write(shared_mem, SandboxMemoryLayout::BASE_ADDRESS, mem_size)
+    }
+
+    #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
+    pub(super) fn write_init_data(&mut self, user_memory: &[u8]) -> Result<()> {
+        let mgr = self.unwrap_mgr_mut();
+        let layout = mgr.layout;
+        let shared_mem = mgr.get_shared_mem_mut();
+        layout.write_init_data(shared_mem, user_memory)?;
+        Ok(())
     }
 }
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
+#![allow(static_mut_refs)]
 // this is a non threadsafe logger for testing purposes, to test the log messages emitted by the guest.
 // it will only log messages from the hyperlight_guest target. It will not log messages from other targets.
 // this target is only used when handling an outb log request from the guest, so this logger will only capture those messages.
@@ -21,7 +21,7 @@ limitations under the License.
 use std::sync::Once;
 use std::thread::current;
 
-use log::{set_logger, set_max_level, Level, Log, Metadata, Record};
+use log::{Level, Log, Metadata, Record, set_logger, set_max_level};
 
 pub static LOGGER: SimpleLogger = SimpleLogger {};
 static INITLOGGER: Once = Once::new();

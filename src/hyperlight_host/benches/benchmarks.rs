@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,14 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::Duration;
-
-use criterion::{criterion_group, criterion_main, Criterion};
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnType};
-use hyperlight_host::sandbox::{MultiUseSandbox, SandboxConfiguration, UninitializedSandbox};
+use criterion::{Criterion, criterion_group, criterion_main};
+use hyperlight_host::GuestBinary;
+use hyperlight_host::sandbox::{
+    Callable, MultiUseSandbox, SandboxConfiguration, UninitializedSandbox,
+};
 use hyperlight_host::sandbox_state::sandbox::EvolvableSandbox;
 use hyperlight_host::sandbox_state::transition::Noop;
-use hyperlight_host::GuestBinary;
 use hyperlight_testing::simple_guest_as_string;
 
 fn create_uninit_sandbox() -> UninitializedSandbox {
@@ -43,11 +42,7 @@ fn guest_call_benchmark(c: &mut Criterion) {
 
         b.iter(|| {
             call_ctx
-                .call(
-                    "Echo",
-                    ReturnType::Int,
-                    Some(vec![ParameterValue::String("hello\n".to_string())]),
-                )
+                .call::<String>("Echo", "hello\n".to_string())
                 .unwrap()
         });
     });
@@ -59,11 +54,7 @@ fn guest_call_benchmark(c: &mut Criterion) {
 
         b.iter(|| {
             sandbox
-                .call_guest_function_by_name(
-                    "Echo",
-                    ReturnType::Int,
-                    Some(vec![ParameterValue::String("hello\n".to_string())]),
-                )
+                .call_guest_function_by_name::<String>("Echo", "hello\n".to_string())
                 .unwrap()
         });
     });
@@ -77,7 +68,6 @@ fn guest_call_benchmark(c: &mut Criterion) {
         let mut config = SandboxConfiguration::default();
         config.set_input_data_size(2 * SIZE + (1024 * 1024)); // 2 * SIZE + 1 MB, to allow 1MB for the rest of the serialized function call
         config.set_heap_size(SIZE as u64 * 15);
-        config.set_max_execution_time(Duration::from_secs(10));
 
         let sandbox = UninitializedSandbox::new(
             GuestBinary::FilePath(simple_guest_as_string().unwrap()),
@@ -88,13 +78,9 @@ fn guest_call_benchmark(c: &mut Criterion) {
 
         b.iter(|| {
             sandbox
-                .call_guest_function_by_name(
+                .call_guest_function_by_name::<()>(
                     "LargeParameters",
-                    ReturnType::Void,
-                    Some(vec![
-                        ParameterValue::VecBytes(large_vec.clone()),
-                        ParameterValue::String(large_string.clone()),
-                    ]),
+                    (large_vec.clone(), large_string.clone()),
                 )
                 .unwrap()
         });
@@ -114,15 +100,7 @@ fn guest_call_benchmark(c: &mut Criterion) {
             uninitialized_sandbox.evolve(Noop::default()).unwrap();
         let mut call_ctx = multiuse_sandbox.new_call_context();
 
-        b.iter(|| {
-            call_ctx
-                .call(
-                    "Add",
-                    ReturnType::Int,
-                    Some(vec![ParameterValue::Int(1), ParameterValue::Int(41)]),
-                )
-                .unwrap()
-        });
+        b.iter(|| call_ctx.call::<i32>("Add", (1_i32, 41_i32)).unwrap());
     });
 
     group.finish();

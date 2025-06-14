@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,27 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::disallowed_macros)]
-use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnType};
 //use opentelemetry_sdk::resource::ResourceBuilder;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use rand::Rng;
-use tracing::{span, Level};
+use tracing::{Level, span};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 extern crate hyperlight_host;
 use std::error::Error;
 use std::io::stdin;
-use std::sync::{Arc, Mutex};
-use std::thread::{self, spawn, JoinHandle};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread::{JoinHandle, spawn};
 
+use hyperlight_host::sandbox::Callable;
 use hyperlight_host::sandbox::uninitialized::UninitializedSandbox;
 use hyperlight_host::sandbox_state::sandbox::EvolvableSandbox;
 use hyperlight_host::sandbox_state::transition::Noop;
 use hyperlight_host::{GuestBinary, MultiUseSandbox, Result as HyperlightResult};
 use hyperlight_testing::simple_guest_as_string;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 //use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::Resource;
@@ -108,7 +107,7 @@ fn run_example(wait_input: bool) -> HyperlightResult<()> {
     let mut join_handles: Vec<JoinHandle<HyperlightResult<()>>> = vec![];
 
     // Construct a new span named "hyperlight otel tracing example" with INFO  level.
-    let span = span!(Level::INFO, "hyperlight otel tracing example",);
+    let span = span!(Level::INFO, "hyperlight otel tracing example");
     let _entered = span.enter();
 
     let should_exit = Arc::new(Mutex::new(false));
@@ -141,12 +140,9 @@ fn run_example(wait_input: bool) -> HyperlightResult<()> {
 
                 // Call a guest function 5 times to generate some log entries.
                 for _ in 0..5 {
-                    let result = multiuse_sandbox.call_guest_function_by_name(
-                        "Echo",
-                        ReturnType::String,
-                        Some(vec![ParameterValue::String("a".to_string())]),
-                    );
-                    assert!(result.is_ok());
+                    multiuse_sandbox
+                        .call_guest_function_by_name::<String>("Echo", "a".to_string())
+                        .unwrap();
                 }
 
                 // Define a message to send to the guest.
@@ -155,17 +151,29 @@ fn run_example(wait_input: bool) -> HyperlightResult<()> {
 
                 // Call a guest function that calls the HostPrint host function 5 times to generate some log entries.
                 for _ in 0..5 {
-                    let result = multiuse_sandbox.call_guest_function_by_name(
-                        "PrintOutput",
-                        ReturnType::Int,
-                        Some(vec![ParameterValue::String(msg.clone())]),
-                    );
-                    assert!(result.is_ok());
+                    multiuse_sandbox
+                        .call_guest_function_by_name::<i32>("PrintOutput", msg.clone())
+                        .unwrap();
                 }
 
                 // Call a function that gets cancelled by the host function 5 times to generate some log entries.
+                const NUM_CALLS: i32 = 5;
+                let barrier = Arc::new(Barrier::new(2));
+                let barrier2 = barrier.clone();
 
-                for i in 0..5 {
+                let interrupt_handle = multiuse_sandbox.interrupt_handle();
+
+                let thread = std::thread::spawn(move || {
+                    for _ in 0..NUM_CALLS {
+                        barrier2.wait();
+                        // Sleep for a short time to allow the guest function to run.
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        // Cancel the host function call.
+                        interrupt_handle.kill();
+                    }
+                });
+
+                for i in 0..NUM_CALLS {
                     let id = Uuid::new_v4();
                     // Construct a new span named "hyperlight tracing call cancellation example thread" with INFO  level.
                     let span = span!(
@@ -176,18 +184,11 @@ fn run_example(wait_input: bool) -> HyperlightResult<()> {
                     );
                     let _entered = span.enter();
                     let mut ctx = multiuse_sandbox.new_call_context();
-
-                    let result = ctx.call("Spin", ReturnType::Void, None);
-                    assert!(result.is_err());
-                    let result = ctx.finish();
-                    assert!(result.is_ok());
-                    multiuse_sandbox = result.unwrap();
+                    barrier.wait();
+                    ctx.call::<()>("Spin", ()).unwrap_err();
+                    multiuse_sandbox = ctx.finish().unwrap();
                 }
-                let sleep_for = {
-                    let mut rng = rand::rng();
-                    rng.random_range(500..3000)
-                };
-                thread::sleep(std::time::Duration::from_millis(sleep_for));
+                thread.join().expect("Thread panicked");
             }
             Ok(())
         });

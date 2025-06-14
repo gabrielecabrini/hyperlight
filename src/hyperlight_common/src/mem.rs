@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -46,6 +46,8 @@ pub struct HyperlightPEB {
     pub code_ptr: u64,
     pub input_stack: GuestMemoryRegion,
     pub output_stack: GuestMemoryRegion,
+    pub init_data: GuestMemoryRegion,
     pub guest_heap: GuestMemoryRegion,
     pub guest_stack: GuestStack,
+    pub host_function_definitions: GuestMemoryRegion,
 }

@@ -4,6 +4,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Prerelease] - Unreleased
 
+## [v0.6.1] - 2025-06-12
+
+### Fixed
+
+- Make OS_PAGE_SIZE public again by @jprendes in https://github.com/hyperlight-dev/hyperlight/pull/609
+- Bring back HostFunctionDefinitions Region by @danbugs in https://github.com/hyperlight-dev/hyperlight/pull/600
+- Allow hyperlight-host to build with x86_64-unknown-linux-musl target by @simongdavies in https://github.com/hyperlight-dev/hyperlight/pull/601
+
+## [v0.6.0] - 2025-06-06
+
+### Fixed
+- Prevent openat from trapping on seccomp thread, by making it return EACCES instead by @ludfjig in https://github.com/hyperlight-dev/hyperlight/pull/573
+
+### Changed
+- Remove hypervisor_handler thread by @ludfjig in https://github.com/hyperlight-dev/hyperlight/pull/533
+- Make GuestBinary::Buffer variant take slice instead of owned vec by @ludfjig in https://github.com/hyperlight-dev/hyperlight/pull/559
+
+### Added
+- Add component bindgen macros by @syntactically in https://github.com/hyperlight-dev/hyperlight/pull/376
+- Adding ws2025 to the dep_rest matrix by @marosset in https://github.com/hyperlight-dev/hyperlight/pull/551
+
+## [v0.5.1] - 2025-06-02
+### Fixed
+- Fixed an issue with the `hyperlight_host` not building on v0.5.0
+
+## [v0.5.0] - 2025-05-28
+
+### Changed
+- Change base address from 0x200_000 to 0x0 by @danbugs in https://github.com/hyperlight-dev/hyperlight/pull/450
+- Unify HostFunctionXX traits into a single HostFunction by @jprendes in https://github.com/hyperlight-dev/hyperlight/pull/
+- Improve the ergonomics of registering host functions by @jprendes in https://github.com/hyperlight-dev/hyperlight/pull/468
+- Remove generics from SupportedParameterType and SupportedReturnType traits by @jprendes in https://github.com/hyperlight-dev/hyperlight/pull/475
+- Improve ergonomics of SupportedParameterType and SupportedReturnType by @jprendes in https://github.com/hyperlight-dev/hyperlight/pull/476
+
+### Fixed
+- Add error logging when MapViewOfFileNuma2 fails by @ludfjig in https://github.com/hyperlight-dev/hyperlight/pull/460
+- Make common and guest libs portable by @danbugs in https://github.com/hyperlight-dev/hyperlight/pull/524
+- Fix breaking changes for hyperlight js by @simongdavies in https://github.com/hyperlight-dev/hyperlight/pull/531
+
+### Added
+- Gdb debug improvements by @dblnz in https://github.com/hyperlight-dev/hyperlight/pull/456
+
+### Removed  
+- Remove kernel stack and boot stack memory regions by @danbugs in https://github.com/hyperlight-dev/hyperlight/pull/451
+- Removing HostFunctionDefinitions region by @danbugs in https://github.com/hyperlight-dev/hyperlight/pull/453
+- Removed host error region by @danbugs in https://github.com/hyperlight-dev/hyperlight/pull/457
+- Remove dependency on the paste crate by @jprendes in https://github.com/hyperlight-dev/hyperlight/pull/467
+- Remove support from hyperlight_host for PE formatted guests by @simongdavies in https://github.com/hyperlight-dev/hyperlight/pull/485
+- Remove in process mode from hyperlight-host by @simongdavies in https://github.com/hyperlight-dev/hyperlight/pull/490
+- Remove `host_print_writer` from the arguments to `UninitializedSandbox::new` by @jprendes in https://github.com/hyperlight-dev/hyperlight/pull/487
+
 
 ## [v0.4.0] - 2025-04-30
 

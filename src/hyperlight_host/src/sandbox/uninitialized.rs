@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,27 +18,25 @@ use std::fmt::Debug;
 use std::option::Option;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use log::LevelFilter;
-use tracing::{instrument, Span};
+use tracing::{Span, instrument};
 
-#[cfg(gdb)]
-use super::config::DebugInfo;
-use super::host_funcs::{default_writer_func, FunctionRegistry};
+use super::host_funcs::{FunctionRegistry, default_writer_func};
 use super::mem_mgr::MemMgrWrapper;
 use super::uninitialized_evolve::evolve_impl_multi_use;
-use crate::func::host_functions::{register_host_function, HostFunction};
+use crate::func::host_functions::{HostFunction, register_host_function};
 use crate::func::{ParameterTuple, SupportedReturnType};
 #[cfg(feature = "build-metadata")]
 use crate::log_build_details;
 use crate::mem::exe::ExeInfo;
-use crate::mem::mgr::{SandboxMemoryManager, STACK_COOKIE_LEN};
+use crate::mem::memory_region::{DEFAULT_GUEST_BLOB_MEM_FLAGS, MemoryRegionFlags};
+use crate::mem::mgr::{STACK_COOKIE_LEN, SandboxMemoryManager};
 use crate::mem::shared_mem::ExclusiveSharedMemory;
 use crate::sandbox::SandboxConfiguration;
 use crate::sandbox_state::sandbox::EvolvableSandbox;
 use crate::sandbox_state::transition::Noop;
-use crate::{log_then_return, new_error, MultiUseSandbox, Result};
+use crate::{MultiUseSandbox, Result, log_then_return, new_error};
 
 #[cfg(all(target_os = "linux", feature = "seccomp"))]
 const EXTRA_ALLOWED_SYSCALLS_FOR_WRITER_FUNC: &[super::ExtraAllowedSyscall] = &[
@@ -55,6 +53,17 @@ const EXTRA_ALLOWED_SYSCALLS_FOR_WRITER_FUNC: &[super::ExtraAllowedSyscall] = &[
     libc::SYS_close,
 ];
 
+#[cfg(any(crashdump, gdb))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SandboxRuntimeConfig {
+    #[cfg(crashdump)]
+    pub(crate) binary_path: Option<String>,
+    #[cfg(gdb)]
+    pub(crate) debug_info: Option<super::config::DebugInfo>,
+    #[cfg(crashdump)]
+    pub(crate) guest_core_dump: bool,
+}
+
 /// A preliminary `Sandbox`, not yet ready to execute guest code.
 ///
 /// Prior to initializing a full-fledged `Sandbox`, you must create one of
@@ -67,12 +76,10 @@ pub struct UninitializedSandbox {
     pub(crate) host_funcs: Arc<Mutex<FunctionRegistry>>,
     /// The memory manager for the sandbox.
     pub(crate) mgr: MemMgrWrapper<ExclusiveSharedMemory>,
-    pub(crate) max_initialization_time: Duration,
-    pub(crate) max_execution_time: Duration,
-    pub(crate) max_wait_for_cancellation: Duration,
     pub(crate) max_guest_log_level: Option<LevelFilter>,
-    #[cfg(gdb)]
-    pub(crate) debug_info: Option<DebugInfo>,
+    pub(crate) config: SandboxConfiguration,
+    #[cfg(any(crashdump, gdb))]
+    pub(crate) rt_cfg: SandboxRuntimeConfig,
 }
 
 impl crate::sandbox_state::sandbox::UninitializedSandbox for UninitializedSandbox {
@@ -117,13 +124,60 @@ impl
     }
 }
 
-/// A `GuestBinary` is either a buffer containing the binary or a path to the binary
+/// A `GuestBinary` is either a buffer or the file path to some data (e.g., a guest binary).
 #[derive(Debug)]
-pub enum GuestBinary {
-    /// A buffer containing the guest binary
-    Buffer(Vec<u8>),
-    /// A path to the guest binary
+pub enum GuestBinary<'a> {
+    /// A buffer containing the GuestBinary
+    Buffer(&'a [u8]),
+    /// A path to the GuestBinary
     FilePath(String),
+}
+
+/// A `GuestBlob` containing data and the permissions for its use.
+#[derive(Debug)]
+pub struct GuestBlob<'a> {
+    /// The data contained in the blob.
+    pub data: &'a [u8],
+    /// The permissions for the blob in memory.
+    /// By default, it's READ
+    pub permissions: MemoryRegionFlags,
+}
+
+impl<'a> From<&'a [u8]> for GuestBlob<'a> {
+    fn from(data: &'a [u8]) -> Self {
+        GuestBlob {
+            data,
+            permissions: DEFAULT_GUEST_BLOB_MEM_FLAGS,
+        }
+    }
+}
+
+/// A `GuestEnvironment` is a structure that contains the guest binary and an optional GuestBinary.
+#[derive(Debug)]
+pub struct GuestEnvironment<'a, 'b> {
+    /// The guest binary, which can be a file path or a buffer.
+    pub guest_binary: GuestBinary<'a>,
+    /// An optional guest blob, which can be used to provide additional data to the guest.
+    pub init_data: Option<GuestBlob<'b>>,
+}
+
+impl<'a, 'b> GuestEnvironment<'a, 'b> {
+    /// Creates a new `GuestEnvironment` with the given guest binary and an optional guest blob.
+    pub fn new(guest_binary: GuestBinary<'a>, init_data: Option<&'b [u8]>) -> Self {
+        GuestEnvironment {
+            guest_binary,
+            init_data: init_data.map(GuestBlob::from),
+        }
+    }
+}
+
+impl<'a> From<GuestBinary<'a>> for GuestEnvironment<'a, '_> {
+    fn from(guest_binary: GuestBinary<'a>) -> Self {
+        GuestEnvironment {
+            guest_binary,
+            init_data: None,
+        }
+    }
 }
 
 impl UninitializedSandbox {
@@ -136,10 +190,13 @@ impl UninitializedSandbox {
     /// The err attribute is used to emit an error should the Result be an error, it uses the std::`fmt::Debug trait` to print the error.
     #[instrument(
         err(Debug),
-        skip(guest_binary),
+        skip(env),
         parent = Span::current()
     )]
-    pub fn new(guest_binary: GuestBinary, cfg: Option<SandboxConfiguration>) -> Result<Self> {
+    pub fn new<'a, 'b>(
+        env: impl Into<GuestEnvironment<'a, 'b>>,
+        cfg: Option<SandboxConfiguration>,
+    ) -> Result<Self> {
         #[cfg(feature = "build-metadata")]
         log_build_details();
 
@@ -147,27 +204,59 @@ impl UninitializedSandbox {
         #[cfg(target_os = "windows")]
         check_windows_version()?;
 
+        let env: GuestEnvironment<'_, '_> = env.into();
+        let guest_binary = env.guest_binary;
+        let guest_blob = env.init_data;
+
         // If the guest binary is a file make sure it exists
         let guest_binary = match guest_binary {
             GuestBinary::FilePath(binary_path) => {
                 let path = Path::new(&binary_path)
                     .canonicalize()
-                    .map_err(|e| new_error!("GuestBinary not found: '{}': {}", binary_path, e))?;
-                GuestBinary::FilePath(
-                    path.into_os_string()
-                        .into_string()
-                        .map_err(|e| new_error!("Error converting OsString to String: {:?}", e))?,
-                )
+                    .map_err(|e| new_error!("GuestBinary not found: '{}': {}", binary_path, e))?
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|e| new_error!("Error converting OsString to String: {:?}", e))?;
+
+                GuestBinary::FilePath(path)
             }
             buffer @ GuestBinary::Buffer(_) => buffer,
         };
 
         let sandbox_cfg = cfg.unwrap_or_default();
 
-        #[cfg(gdb)]
-        let debug_info = sandbox_cfg.get_guest_debug_info();
+        #[cfg(any(crashdump, gdb))]
+        let rt_cfg = {
+            #[cfg(crashdump)]
+            let guest_core_dump = sandbox_cfg.get_guest_core_dump();
+
+            #[cfg(gdb)]
+            let debug_info = sandbox_cfg.get_guest_debug_info();
+
+            #[cfg(crashdump)]
+            let binary_path = if let GuestBinary::FilePath(ref path) = guest_binary {
+                Some(path.clone())
+            } else {
+                None
+            };
+
+            SandboxRuntimeConfig {
+                #[cfg(crashdump)]
+                binary_path,
+                #[cfg(gdb)]
+                debug_info,
+                #[cfg(crashdump)]
+                guest_core_dump,
+            }
+        };
+
         let mut mem_mgr_wrapper = {
-            let mut mgr = UninitializedSandbox::load_guest_binary(sandbox_cfg, &guest_binary)?;
+            let mut mgr = UninitializedSandbox::load_guest_binary(
+                sandbox_cfg,
+                &guest_binary,
+                guest_blob.as_ref(),
+            )?;
+
             let stack_guard = Self::create_stack_guard();
             mgr.set_stack_guard(&stack_guard)?;
             MemMgrWrapper::new(mgr, stack_guard)
@@ -175,21 +264,20 @@ impl UninitializedSandbox {
 
         mem_mgr_wrapper.write_memory_layout()?;
 
+        // if env has a guest blob, load it into shared mem
+        if let Some(blob) = guest_blob {
+            mem_mgr_wrapper.write_init_data(blob.data)?;
+        }
+
         let host_funcs = Arc::new(Mutex::new(FunctionRegistry::default()));
 
         let mut sandbox = Self {
             host_funcs,
             mgr: mem_mgr_wrapper,
-            max_initialization_time: Duration::from_millis(
-                sandbox_cfg.get_max_initialization_time() as u64,
-            ),
-            max_execution_time: Duration::from_millis(sandbox_cfg.get_max_execution_time() as u64),
-            max_wait_for_cancellation: Duration::from_millis(
-                sandbox_cfg.get_max_wait_for_cancellation() as u64,
-            ),
             max_guest_log_level: None,
-            #[cfg(gdb)]
-            debug_info,
+            config: sandbox_cfg,
+            #[cfg(any(crashdump, gdb))]
+            rt_cfg,
         };
 
         // If we were passed a writer for host print register it otherwise use the default.
@@ -219,13 +307,14 @@ impl UninitializedSandbox {
     pub(super) fn load_guest_binary(
         cfg: SandboxConfiguration,
         guest_binary: &GuestBinary,
+        guest_blob: Option<&GuestBlob>,
     ) -> Result<SandboxMemoryManager<ExclusiveSharedMemory>> {
         let mut exe_info = match guest_binary {
             GuestBinary::FilePath(bin_path_str) => ExeInfo::from_file(bin_path_str)?,
             GuestBinary::Buffer(buffer) => ExeInfo::from_buf(buffer)?,
         };
 
-        SandboxMemoryManager::load_guest_binary_into_memory(cfg, &mut exe_info)
+        SandboxMemoryManager::load_guest_binary_into_memory(cfg, &mut exe_info, guest_blob)
     }
 
     /// Set the max log level to be used by the guest.
@@ -311,7 +400,7 @@ impl UninitializedSandbox {
 // Hyperlight is only supported on Windows 11 and Windows Server 2022 and later
 #[cfg(target_os = "windows")]
 fn check_windows_version() -> Result<()> {
-    use windows_version::{is_server, OsVersion};
+    use windows_version::{OsVersion, is_server};
     const WINDOWS_MAJOR: u32 = 10;
     const WINDOWS_MINOR: u32 = 0;
     const WINDOWS_PACK: u32 = 0;
@@ -334,20 +423,36 @@ fn check_windows_version() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::channel;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::mpsc::channel;
     use std::{fs, thread};
 
     use crossbeam_queue::ArrayQueue;
     use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, ReturnValue};
     use hyperlight_testing::simple_guest_as_string;
 
-    use crate::sandbox::uninitialized::GuestBinary;
     use crate::sandbox::SandboxConfiguration;
+    use crate::sandbox::uninitialized::{GuestBinary, GuestEnvironment};
     use crate::sandbox_state::sandbox::EvolvableSandbox;
     use crate::sandbox_state::transition::Noop;
-    use crate::{new_error, MultiUseSandbox, Result, UninitializedSandbox};
+    use crate::{MultiUseSandbox, Result, UninitializedSandbox, new_error};
+
+    #[test]
+    fn test_load_extra_blob() {
+        let binary_path = simple_guest_as_string().unwrap();
+        let buffer = [0xde, 0xad, 0xbe, 0xef];
+        let guest_env =
+            GuestEnvironment::new(GuestBinary::FilePath(binary_path.clone()), Some(&buffer));
+
+        let uninitialized_sandbox = UninitializedSandbox::new(guest_env, None).unwrap();
+        let mut sandbox: MultiUseSandbox = uninitialized_sandbox.evolve(Noop::default()).unwrap();
+
+        let res = sandbox
+            .call_guest_function_by_name::<Vec<u8>>("ReadFromUserMemory", (4u64, buffer.to_vec()))
+            .expect("Failed to call ReadFromUserMemory");
+
+        assert_eq!(res, buffer.to_vec());
+    }
 
     #[test]
     fn test_new_sandbox() {
@@ -372,8 +477,6 @@ mod tests {
             cfg.set_output_data_size(0x1000);
             cfg.set_stack_size(0x1000);
             cfg.set_heap_size(0x1000);
-            cfg.set_max_execution_time(Duration::from_millis(1001));
-            cfg.set_max_execution_cancel_wait_time(Duration::from_millis(9));
             Some(cfg)
         };
 
@@ -392,7 +495,7 @@ mod tests {
 
         let binary_path = simple_guest_as_string().unwrap();
         let sandbox =
-            UninitializedSandbox::new(GuestBinary::Buffer(fs::read(binary_path).unwrap()), None);
+            UninitializedSandbox::new(GuestBinary::Buffer(&fs::read(binary_path).unwrap()), None);
         assert!(sandbox.is_ok());
 
         // Test with a invalid guest binary buffer
@@ -400,7 +503,7 @@ mod tests {
         let binary_path = simple_guest_as_string().unwrap();
         let mut bytes = fs::read(binary_path).unwrap();
         let _ = bytes.split_off(100);
-        let sandbox = UninitializedSandbox::new(GuestBinary::Buffer(bytes), None);
+        let sandbox = UninitializedSandbox::new(GuestBinary::Buffer(&bytes), None);
         assert!(sandbox.is_err());
     }
 
@@ -410,8 +513,12 @@ mod tests {
 
         let simple_guest_path = simple_guest_as_string().unwrap();
 
-        UninitializedSandbox::load_guest_binary(cfg, &GuestBinary::FilePath(simple_guest_path))
-            .unwrap();
+        UninitializedSandbox::load_guest_binary(
+            cfg,
+            &GuestBinary::FilePath(simple_guest_path),
+            None.as_ref(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -787,8 +894,8 @@ mod tests {
         use hyperlight_testing::tracing_subscriber::TracingSubscriber as TestSubscriber;
         use serde_json::{Map, Value};
         use tracing::Level as tracing_level;
-        use tracing_core::callsite::rebuild_interest_cache;
         use tracing_core::Subscriber;
+        use tracing_core::callsite::rebuild_interest_cache;
         use uuid::Uuid;
 
         use crate::testing::log_values::build_metadata_testing::try_to_strings;
@@ -895,7 +1002,7 @@ mod tests {
     fn test_log_trace() {
         use std::path::PathBuf;
 
-        use hyperlight_testing::logger::{Logger as TestLogger, LOGGER as TEST_LOGGER};
+        use hyperlight_testing::logger::{LOGGER as TEST_LOGGER, Logger as TestLogger};
         use log::Level;
         use tracing_core::callsite::rebuild_interest_cache;
 
@@ -949,9 +1056,11 @@ mod tests {
 
             let logcall = TEST_LOGGER.get_log_call(16).unwrap();
             assert_eq!(Level::Error, logcall.level);
-            assert!(logcall
-                .args
-                .starts_with("error=Error(\"GuestBinary not found:"));
+            assert!(
+                logcall
+                    .args
+                    .starts_with("error=Error(\"GuestBinary not found:")
+            );
             assert_eq!("hyperlight_host::sandbox::uninitialized", logcall.target);
 
             // Log record 18
@@ -1001,9 +1110,11 @@ mod tests {
 
             let logcall = TEST_LOGGER.get_log_call(1).unwrap();
             assert_eq!(Level::Error, logcall.level);
-            assert!(logcall
-                .args
-                .starts_with("error=Error(\"GuestBinary not found:"));
+            assert!(
+                logcall
+                    .args
+                    .starts_with("error=Error(\"GuestBinary not found:")
+            );
             assert_eq!("hyperlight_host::sandbox::uninitialized", logcall.target);
         }
         {

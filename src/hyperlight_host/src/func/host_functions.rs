@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,8 +20,71 @@ use hyperlight_common::flatbuffer_wrappers::function_types::{ParameterValue, Ret
 
 use super::utils::for_each_tuple;
 use super::{ParameterTuple, ResultType, SupportedReturnType};
+use crate::sandbox::host_funcs::FunctionEntry;
 use crate::sandbox::{ExtraAllowedSyscall, UninitializedSandbox};
-use crate::{log_then_return, new_error, Result};
+use crate::{Result, new_error};
+
+/// A sandbox on which (primitive) host functions can be registered
+///
+pub trait Registerable {
+    /// Register a primitive host function
+    fn register_host_function<Args: ParameterTuple, Output: SupportedReturnType>(
+        &mut self,
+        name: &str,
+        hf: impl Into<HostFunction<Output, Args>>,
+    ) -> Result<()>;
+    /// Register a primitive host function whose worker thread has
+    /// extra permissive seccomp filters installed
+    #[cfg(all(feature = "seccomp", target_os = "linux"))]
+    fn register_host_function_with_syscalls<Args: ParameterTuple, Output: SupportedReturnType>(
+        &mut self,
+        name: &str,
+        hf: impl Into<HostFunction<Output, Args>>,
+        eas: Vec<ExtraAllowedSyscall>,
+    ) -> Result<()>;
+}
+impl Registerable for UninitializedSandbox {
+    fn register_host_function<Args: ParameterTuple, Output: SupportedReturnType>(
+        &mut self,
+        name: &str,
+        hf: impl Into<HostFunction<Output, Args>>,
+    ) -> Result<()> {
+        let mut hfs = self
+            .host_funcs
+            .try_lock()
+            .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?;
+
+        let entry = FunctionEntry {
+            function: hf.into().into(),
+            extra_allowed_syscalls: None,
+            parameter_types: Args::TYPE,
+            return_type: Output::TYPE,
+        };
+
+        (*hfs).register_host_function(name.to_string(), entry, self.mgr.unwrap_mgr_mut())
+    }
+    #[cfg(all(feature = "seccomp", target_os = "linux"))]
+    fn register_host_function_with_syscalls<Args: ParameterTuple, Output: SupportedReturnType>(
+        &mut self,
+        name: &str,
+        hf: impl Into<HostFunction<Output, Args>>,
+        eas: Vec<ExtraAllowedSyscall>,
+    ) -> Result<()> {
+        let mut hfs = self
+            .host_funcs
+            .try_lock()
+            .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?;
+
+        let entry = FunctionEntry {
+            function: hf.into().into(),
+            extra_allowed_syscalls: Some(eas),
+            parameter_types: Args::TYPE,
+            return_type: Output::TYPE,
+        };
+
+        (*hfs).register_host_function(name.to_string(), entry, self.mgr.unwrap_mgr_mut())
+    }
+}
 
 /// A representation of a host function.
 /// This is a thin wrapper around a `Fn(Args) -> Result<Output>`.
@@ -136,31 +199,18 @@ pub(crate) fn register_host_function<Args: ParameterTuple, Output: SupportedRetu
 ) -> Result<()> {
     let func = func.into().into();
 
-    if let Some(_eas) = extra_allowed_syscalls {
-        if cfg!(all(feature = "seccomp", target_os = "linux")) {
-            // Register with extra allowed syscalls
-            #[cfg(all(feature = "seccomp", target_os = "linux"))]
-            {
-                sandbox
-                    .host_funcs
-                    .try_lock()
-                    .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?
-                    .register_host_function_with_syscalls(name.to_string(), func, _eas)?;
-            }
-        } else {
-            // Log and return an error
-            log_then_return!(
-                "Extra allowed syscalls are only supported on Linux with seccomp enabled"
-            );
-        }
-    } else {
-        // Register without extra allowed syscalls
-        sandbox
-            .host_funcs
-            .try_lock()
-            .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?
-            .register_host_function(name.to_string(), func)?;
-    }
+    let entry = FunctionEntry {
+        function: func,
+        extra_allowed_syscalls: extra_allowed_syscalls.clone(),
+        parameter_types: Args::TYPE,
+        return_type: Output::TYPE,
+    };
+
+    sandbox
+        .host_funcs
+        .try_lock()
+        .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?
+        .register_host_function(name.to_string(), entry, sandbox.mgr.unwrap_mgr_mut())?;
 
     Ok(())
 }

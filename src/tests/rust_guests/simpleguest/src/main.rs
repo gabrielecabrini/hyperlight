@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -41,14 +41,16 @@ use hyperlight_common::flatbuffer_wrappers::guest_error::ErrorCode;
 use hyperlight_common::flatbuffer_wrappers::guest_log_level::LogLevel;
 use hyperlight_common::flatbuffer_wrappers::util::get_flatbuffer_result;
 use hyperlight_common::mem::PAGE_SIZE;
-use hyperlight_guest::entrypoint::{abort_with_code, abort_with_code_and_message};
 use hyperlight_guest::error::{HyperlightGuestError, Result};
-use hyperlight_guest::guest_function_definition::GuestFunctionDefinition;
-use hyperlight_guest::guest_function_register::register_function;
-use hyperlight_guest::host_function_call::{call_host_function, call_host_function_internal};
-use hyperlight_guest::memory::malloc;
-use hyperlight_guest::{logging, MIN_STACK_ADDRESS};
-use log::{error, LevelFilter};
+use hyperlight_guest::exit::{abort_with_code, abort_with_code_and_message};
+use hyperlight_guest_bin::guest_function::definition::GuestFunctionDefinition;
+use hyperlight_guest_bin::guest_function::register::register_function;
+use hyperlight_guest_bin::host_comm::{
+    call_host_function, call_host_function_without_returning_result, read_n_bytes_from_user_memory,
+};
+use hyperlight_guest_bin::memory::malloc;
+use hyperlight_guest_bin::{MIN_STACK_ADDRESS, guest_logger};
+use log::{LevelFilter, error};
 
 extern crate hyperlight_guest;
 
@@ -56,9 +58,11 @@ static mut BIGARRAY: [i32; 1024 * 1024] = [0; 1024 * 1024];
 
 fn set_static(_: &FunctionCall) -> Result<Vec<u8>> {
     unsafe {
+        #[allow(static_mut_refs)]
         for val in BIGARRAY.iter_mut() {
             *val = 1;
         }
+        #[allow(static_mut_refs)]
         Ok(get_flatbuffer_result(BIGARRAY.len() as i32))
     }
 }
@@ -354,7 +358,10 @@ fn print_ten_args(function_call: &FunctionCall) -> Result<Vec<u8>> {
         function_call.parameters.clone().unwrap()[8].clone(),
         function_call.parameters.clone().unwrap()[9].clone(),
     ) {
-        let message = format!("Message: arg1:{} arg2:{} arg3:{} arg4:{} arg5:{} arg6:{} arg7:{} arg8:{} arg9:{} arg10:{}.", arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10);
+        let message = format!(
+            "Message: arg1:{} arg2:{} arg3:{} arg4:{} arg5:{} arg6:{} arg7:{} arg8:{} arg9:{} arg10:{}.",
+            arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10
+        );
         print_output(&message)
     } else {
         Err(HyperlightGuestError::new(
@@ -390,7 +397,10 @@ fn print_eleven_args(function_call: &FunctionCall) -> Result<Vec<u8>> {
         function_call.parameters.clone().unwrap()[9].clone(),
         function_call.parameters.clone().unwrap()[10].clone(),
     ) {
-        let message = format!("Message: arg1:{} arg2:{} arg3:{} arg4:{} arg5:{} arg6:{} arg7:{} arg8:{} arg9:{} arg10:{} arg11:{:.3}.", arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11);
+        let message = format!(
+            "Message: arg1:{} arg2:{} arg3:{} arg4:{} arg5:{} arg6:{} arg7:{} arg8:{} arg9:{} arg10:{} arg11:{:.3}.",
+            arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11
+        );
         print_output(&message)
     } else {
         Err(HyperlightGuestError::new(
@@ -690,6 +700,21 @@ fn violate_seccomp_filters(function_call: &FunctionCall) -> Result<Vec<u8>> {
     }
 }
 
+fn call_given_paramless_hostfunc_that_returns_i64(function_call: &FunctionCall) -> Result<Vec<u8>> {
+    if let ParameterValue::String(hostfuncname) =
+        function_call.parameters.clone().unwrap()[0].clone()
+    {
+        let res = call_host_function::<i64>(&hostfuncname, None, ReturnType::Long)?;
+
+        Ok(get_flatbuffer_result(res))
+    } else {
+        Err(HyperlightGuestError::new(
+            ErrorCode::GuestFunctionParameterTypeMismatch,
+            "Invalid parameters passed to test_rust_malloc".to_string(),
+        ))
+    }
+}
+
 fn add(function_call: &FunctionCall) -> Result<Vec<u8>> {
     if let (ParameterValue::Int(a), ParameterValue::Int(b)) = (
         function_call.parameters.clone().unwrap()[0].clone(),
@@ -725,8 +750,42 @@ fn large_parameters(function_call: &FunctionCall) -> Result<Vec<u8>> {
     }
 }
 
+fn read_from_user_memory(function_call: &FunctionCall) -> Result<Vec<u8>> {
+    if let (ParameterValue::ULong(num), ParameterValue::VecBytes(expected)) = (
+        function_call.parameters.clone().unwrap()[0].clone(),
+        function_call.parameters.clone().unwrap()[1].clone(),
+    ) {
+        let bytes = read_n_bytes_from_user_memory(num).expect("Failed to read from user memory");
+
+        // verify that the user memory contains the expected data
+        if bytes != expected {
+            error!("User memory does not contain the expected data");
+            return Err(HyperlightGuestError::new(
+                ErrorCode::GuestError,
+                "User memory does not contain the expected data".to_string(),
+            ));
+        }
+
+        Ok(get_flatbuffer_result(&*bytes))
+    } else {
+        Err(HyperlightGuestError::new(
+            ErrorCode::GuestFunctionParameterTypeMismatch,
+            "Invalid parameters passed to read_from_user_memory".to_string(),
+        ))
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn hyperlight_main() {
+    let read_from_user_memory_def = GuestFunctionDefinition::new(
+        "ReadFromUserMemory".to_string(),
+        Vec::from(&[ParameterType::ULong, ParameterType::VecBytes]),
+        ReturnType::VecBytes,
+        read_from_user_memory as usize,
+    );
+
+    register_function(read_from_user_memory_def);
+
     let set_static_def = GuestFunctionDefinition::new(
         "SetStatic".to_string(),
         Vec::new(),
@@ -1127,6 +1186,14 @@ pub extern "C" fn hyperlight_main() {
         large_parameters as usize,
     );
     register_function(large_parameters_def);
+
+    let call_given_hostfunc_def = GuestFunctionDefinition::new(
+        "CallGivenParamlessHostFuncThatReturnsI64".to_string(),
+        Vec::from(&[ParameterType::String]),
+        ReturnType::Long,
+        call_given_paramless_hostfunc_that_returns_i64 as usize,
+    );
+    register_function(call_given_hostfunc_def);
 }
 
 #[no_mangle]
@@ -1142,7 +1209,7 @@ pub fn guest_dispatch_function(function_call: FunctionCall) -> Result<Vec<u8>> {
 
     let message = "Hi this is a log message that will overwrite the shared buffer if the stack is not working correctly";
 
-    logging::log_message(
+    guest_logger::log_message(
         LogLevel::Information,
         message,
         "source",
@@ -1186,15 +1253,19 @@ fn fuzz_host_function(func: FunctionCall) -> Result<Vec<u8>> {
             return Err(HyperlightGuestError::new(
                 ErrorCode::GuestFunctionParameterTypeMismatch,
                 "Invalid parameters passed to fuzz_host_function".to_string(),
-            ))
+            ));
         }
     };
 
     // Because we do not know at compile time the actual return type of the host function to be called
     // we cannot use the `call_host_function<T>` generic function.
-    // We need to use the `call_host_function_internal` function that does not retrieve the return
+    // We need to use the `call_host_function_without_returning_result` function that does not retrieve the return
     // value
-    call_host_function_internal(&host_func_name, Some(params), func.expected_return_type)
-        .expect("failed to call host function");
+    call_host_function_without_returning_result(
+        &host_func_name,
+        Some(params),
+        func.expected_return_type,
+    )
+    .expect("failed to call host function");
     Ok(get_flatbuffer_result(()))
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Hyperlight Authors.
+Copyright 2025  The Hyperlight Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,17 +16,19 @@ limitations under the License.
 
 use core::ffi::c_void;
 
-use tracing::{instrument, Span};
-use windows::core::s;
+use tracing::{Span, instrument};
 use windows::Win32::Foundation::{FreeLibrary, HANDLE};
 use windows::Win32::System::Hypervisor::*;
 use windows::Win32::System::LibraryLoader::*;
+use windows::core::s;
 use windows_result::HRESULT;
 
 use super::wrappers::HandleWrapper;
+#[cfg(crashdump)]
+use crate::HyperlightError;
 use crate::hypervisor::wrappers::{WHvFPURegisters, WHvGeneralRegisters, WHvSpecialRegisters};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags};
-use crate::{new_error, Result};
+use crate::{Result, new_error};
 
 /// Interop calls for Windows Hypervisor Platform APIs
 ///
@@ -407,6 +409,59 @@ impl VMProcessor {
                 rflags: out[17].Reg64,
             })
         }
+    }
+
+    #[cfg(crashdump)]
+    #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
+    pub(super) fn get_xsave(&self) -> Result<Vec<u8>> {
+        // Get the required buffer size by calling with NULL buffer
+        let mut buffer_size_needed: u32 = 0;
+
+        unsafe {
+            // First call with NULL buffer to get required size
+            // If the buffer is not large enough, the return value is WHV_E_INSUFFICIENT_BUFFER.
+            // In this case, BytesWritten receives the required buffer size.
+            let result = WHvGetVirtualProcessorXsaveState(
+                self.get_partition_hdl(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut buffer_size_needed,
+            );
+
+            // If it failed for reasons other than insufficient buffer, return error
+            if let Err(e) = result {
+                if e.code() != windows::Win32::Foundation::WHV_E_INSUFFICIENT_BUFFER {
+                    return Err(HyperlightError::WindowsAPIError(e));
+                }
+            }
+        }
+
+        // Create a buffer with the appropriate size
+        let mut xsave_buffer = vec![0; buffer_size_needed as usize];
+
+        // Get the Xsave state
+        let mut written_bytes = 0;
+        unsafe {
+            WHvGetVirtualProcessorXsaveState(
+                self.get_partition_hdl(),
+                0,
+                xsave_buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                buffer_size_needed,
+                &mut written_bytes,
+            )
+        }?;
+
+        // Check if the number of written bytes matches the expected size
+        if written_bytes != buffer_size_needed {
+            return Err(new_error!(
+                "Failed to get Xsave state: expected {} bytes, got {}",
+                buffer_size_needed,
+                written_bytes
+            ));
+        }
+
+        Ok(xsave_buffer)
     }
 
     pub(super) fn set_fpu(&mut self, regs: &WHvFPURegisters) -> Result<()> {
